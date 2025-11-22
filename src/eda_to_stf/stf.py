@@ -112,8 +112,11 @@ def generate_entity_yaml(
         "entity_level": 0
     })
 
-    # Build variables list
+    # Separate category-only variables (no provider_label) from data variables
+    # Category-only variables are organizational containers without actual data
+    categories_list = []
     var_list = []
+
     for var in variables:
         var_entry: dict[str, Any] = {
             "variable": var.stable_id,
@@ -134,7 +137,11 @@ def generate_entity_yaml(
         if var.parent_stable_id:
             var_entry["parent_variable"] = var.parent_stable_id
 
-        var_list.append(var_entry)
+        # Variables without provider_label are category-only (organizational)
+        if var.provider_label:
+            var_list.append(var_entry)
+        else:
+            categories_list.append(var_entry)
 
     result: dict[str, Any] = {
         "name": entity_name,
@@ -143,6 +150,10 @@ def generate_entity_yaml(
         "id_columns": id_columns,
         "variables": var_list,
     }
+
+    # Only include categories section if there are category-only variables
+    if categories_list:
+        result["categories"] = categories_list
 
     # Add EDA-specific fields as comments/extensions
     if entity.description:
