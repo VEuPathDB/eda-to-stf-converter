@@ -1,0 +1,17 @@
+# Example configuration for EDA to STF Converter
+# Copy this file to config.yaml and update with your settings
+
+database:
+  # Database type: postgres or oracle
+  type: oracle
+  host: localhost
+  port: 1521
+  name: ORCL  # Oracle service name or SID
+  user: your_username
+  # password should be set via environment variable DB_PASSWORD
+
+output:
+  # Directory for STF output files
+  directory: ./output
+  # File naming pattern
+  pattern: "{table}_{timestamp}.stf"
