@@ -92,6 +92,9 @@ def generate_entity_yaml(
     """Generate entity-<name>.yaml content."""
     entity_name = entity_name_for_stf(entity)
 
+    # Build set of entity stable_ids in the hierarchy (for filtering parent references)
+    entity_ids_in_hierarchy = {entity.stable_id} | {a.stable_id for a in ancestors}
+
     # Build id_columns - ancestors first, then self
     id_columns = []
 
@@ -118,30 +121,38 @@ def generate_entity_yaml(
     var_list = []
 
     for var in variables:
-        var_entry: dict[str, Any] = {
-            "variable": var.stable_id,
-            "display_name": var.display_name or var.stable_id,
-            "data_type": map_data_type(var.data_type),
-            "data_shape": map_data_shape(var.data_shape),
-        }
-
-        if var.provider_label:
-            var_entry["provider_label"] = [var.provider_label]
-
-        if var.definition:
-            var_entry["definition"] = var.definition
-
-        if var.unit:
-            var_entry["unit"] = var.unit
-
-        if var.parent_stable_id:
-            var_entry["parent_variable"] = var.parent_stable_id
-
         # Variables without provider_label are category-only (organizational)
-        if var.provider_label:
-            var_list.append(var_entry)
+        is_category = not var.provider_label
+
+        if is_category:
+            cat_entry: dict[str, Any] = {
+                "category": var.stable_id,
+                "display_name": var.display_name or var.stable_id,
+                "data_type": map_data_type(var.data_type),
+                "data_shape": map_data_shape(var.data_shape),
+            }
+            if var.definition:
+                cat_entry["definition"] = var.definition
+            # Only set parent_category if parent is another variable/category, not any entity in the hierarchy
+            if var.parent_stable_id and var.parent_stable_id not in entity_ids_in_hierarchy:
+                cat_entry["parent_category"] = var.parent_stable_id
+            categories_list.append(cat_entry)
         else:
-            categories_list.append(var_entry)
+            var_entry: dict[str, Any] = {
+                "variable": var.stable_id,
+                "display_name": var.display_name or var.stable_id,
+                "data_type": map_data_type(var.data_type),
+                "data_shape": map_data_shape(var.data_shape),
+                "provider_label": [var.provider_label],
+            }
+            if var.definition:
+                var_entry["definition"] = var.definition
+            if var.unit:
+                var_entry["unit"] = var.unit
+            # Only set parent_category if parent is another variable/category, not any entity in the hierarchy
+            if var.parent_stable_id and var.parent_stable_id not in entity_ids_in_hierarchy:
+                var_entry["parent_category"] = var.parent_stable_id
+            var_list.append(var_entry)
 
     result: dict[str, Any] = {
         "name": entity_name,
