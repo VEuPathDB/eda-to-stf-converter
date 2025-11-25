@@ -1,6 +1,7 @@
 """STF (Study Transfer Format) file generator."""
 
 import csv
+import json
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +39,47 @@ def map_data_shape(eda_shape: str | None) -> str:
         "continuous": "continuous",
         "categorical": "categorical",
         "ordinal": "ordinal",
+        "binary": "binary",
     }
     return mapping.get(eda_shape.lower(), "categorical")
+
+
+def parse_vocabulary(vocab_json: str | None) -> list | None:
+    """Parse vocabulary JSON field into list for ordinal_levels.
+
+    Args:
+        vocab_json: JSON string from vocabulary CLOB field
+
+    Returns:
+        List of vocabulary items or None if empty/invalid
+    """
+    if not vocab_json:
+        return None
+
+    try:
+        vocab = json.loads(vocab_json)
+        if isinstance(vocab, list):
+            return vocab
+        return None
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def parse_hidden(hidden_str: str | None) -> list | None:
+    """Parse hidden field into list.
+
+    Args:
+        hidden_str: Comma-separated string or single value
+
+    Returns:
+        List of hidden contexts or None if empty
+    """
+    if not hidden_str:
+        return None
+
+    # Split by comma and strip whitespace
+    items = [item.strip() for item in hidden_str.split(',') if item.strip()]
+    return items if items else None
 
 
 def build_entity_hierarchy(entities: list[Entity]) -> dict[str, list[Entity]]:
@@ -131,27 +171,102 @@ def generate_entity_yaml(
                 "data_type": map_data_type(var.data_type),
                 "data_shape": map_data_shape(var.data_shape),
             }
+
             if var.definition:
                 cat_entry["definition"] = var.definition
+
             # Only set parent_category if parent is another variable/category, not any entity in the hierarchy
             if var.parent_stable_id and var.parent_stable_id not in entity_ids_in_hierarchy:
                 cat_entry["parent_category"] = var.parent_stable_id
+
+            # Display metadata for categories
+            if var.display_order is not None:
+                cat_entry["display_order"] = var.display_order
+            if var.display_type:
+                cat_entry["display_type"] = var.display_type
+
             categories_list.append(cat_entry)
         else:
+            # Ordinal levels from vocabulary - parse first to determine data_shape and data_type
+            ordinal_levels = parse_vocabulary(var.vocabulary)
+
+            # If ordinal_levels exists, data_shape should be ordinal and data_type should be string
+            if ordinal_levels:
+                data_shape = "ordinal"
+                data_type = "string"
+            else:
+                data_shape = map_data_shape(var.data_shape)
+                data_type = map_data_type(var.data_type)
+
             var_entry: dict[str, Any] = {
                 "variable": var.stable_id,
                 "display_name": var.display_name or var.stable_id,
-                "data_type": map_data_type(var.data_type),
-                "data_shape": map_data_shape(var.data_shape),
+                "data_type": data_type,
+                "data_shape": data_shape,
                 "provider_label": [var.provider_label],
             }
+
+            # Required fields
             if var.definition:
                 var_entry["definition"] = var.definition
-            if var.unit:
-                var_entry["unit"] = var.unit
+
             # Only set parent_category if parent is another variable/category, not any entity in the hierarchy
             if var.parent_stable_id and var.parent_stable_id not in entity_ids_in_hierarchy:
                 var_entry["parent_category"] = var.parent_stable_id
+
+            # Add ordinal levels if present
+            if ordinal_levels:
+                var_entry["ordinal_levels"] = ordinal_levels
+
+            # Display metadata
+            if var.display_order is not None:
+                var_entry["display_order"] = var.display_order
+            if var.display_type:
+                var_entry["display_type"] = var.display_type
+
+            # Ranges and binning
+            if var.display_range_min:
+                var_entry["display_range_min"] = var.display_range_min
+            if var.display_range_max:
+                var_entry["display_range_max"] = var.display_range_max
+            if var.bin_width_override:
+                var_entry["bin_width_override"] = var.bin_width_override
+
+            # Scale and units
+            if var.scale:
+                var_entry["scale"] = var.scale
+            if var.unit:
+                var_entry["unit"] = var.unit
+
+            # Boolean flags
+            if var.is_temporal is not None:
+                var_entry["is_temporal"] = var.is_temporal
+            if var.is_featured is not None:
+                var_entry["is_featured"] = var.is_featured
+            if var.is_merge_key is not None:
+                var_entry["is_merge_key"] = var.is_merge_key
+            if var.is_repeated is not None:
+                var_entry["is_repeated"] = var.is_repeated
+            if var.is_multi_valued is not None:
+                var_entry["is_multi_valued"] = var.is_multi_valued
+            if var.has_values is not None:
+                var_entry["has_values"] = var.has_values
+            if var.has_study_dependent_vocabulary is not None:
+                var_entry["has_study_dependent_vocabulary"] = var.has_study_dependent_vocabulary
+            if var.impute_zero is not None:
+                var_entry["impute_zero"] = var.impute_zero
+
+            # Hidden contexts
+            hidden_list = parse_hidden(var.hidden)
+            if hidden_list:
+                var_entry["hidden"] = hidden_list
+
+            # Variable specs for special processing
+            if var.weighting_variable_spec:
+                var_entry["weighting_variable_spec"] = var.weighting_variable_spec
+            if var.variable_spec_to_impute_zeroes_for:
+                var_entry["variable_spec_to_impute_zeroes_for"] = var.variable_spec_to_impute_zeroes_for
+
             var_list.append(var_entry)
 
     result: dict[str, Any] = {

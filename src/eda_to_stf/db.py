@@ -37,10 +37,36 @@ class Variable:
     provider_label: str | None
     display_name: str | None
     definition: str | None
+    vocabulary: str | None  # CLOB field, JSON string
+    display_type: str | None
+    hidden: str | None
+    display_order: int | None
+    display_range_min: str | None
+    display_range_max: str | None
+    range_min: str | None
+    range_max: str | None
+    bin_width_override: str | None
+    bin_width_computed: str | None
+    mean: str | None
+    median: str | None
+    lower_quartile: str | None
+    upper_quartile: str | None
+    is_temporal: bool | None
+    is_featured: bool | None
+    is_merge_key: bool | None
+    impute_zero: bool | None
+    is_repeated: bool | None
+    variable_spec_to_impute_zeroes_for: str | None
+    has_study_dependent_vocabulary: bool | None
+    weighting_variable_spec: str | None
+    has_values: bool | None
     data_type: str | None
     data_shape: str | None
+    distinct_values_count: int | None
+    is_multi_valued: bool | None
     unit: str | None
-    display_order: int | None
+    scale: str | None
+    precision: int | None
 
 
 def build_connection_url(config: dict) -> str:
@@ -180,10 +206,36 @@ class EdaDatabase:
                         provider_label,
                         display_name,
                         definition,
+                        vocabulary,
+                        display_type,
+                        hidden,
+                        display_order,
+                        display_range_min,
+                        display_range_max,
+                        range_min,
+                        range_max,
+                        bin_width_override,
+                        bin_width_computed,
+                        mean,
+                        median,
+                        lower_quartile,
+                        upper_quartile,
+                        is_temporal,
+                        is_featured,
+                        is_merge_key,
+                        impute_zero,
+                        is_repeated,
+                        variable_spec_to_impute_zeroes_for,
+                        has_study_dependent_vocabulary,
+                        weighting_variable_spec,
+                        has_values,
                         data_type,
                         data_shape,
+                        distinct_values_count,
+                        is_multi_valued,
                         unit,
-                        display_order
+                        scale,
+                        precision
                     FROM {table_name}
                     ORDER BY display_order NULLS LAST, stable_id
                 """)
@@ -197,10 +249,36 @@ class EdaDatabase:
                     provider_label=row[2],
                     display_name=row[3],
                     definition=row[4],
-                    data_type=row[5],
-                    data_shape=row[6],
-                    unit=row[7],
-                    display_order=row[8]
+                    vocabulary=row[5],
+                    display_type=row[6],
+                    hidden=row[7],
+                    display_order=row[8],
+                    display_range_min=row[9],
+                    display_range_max=row[10],
+                    range_min=row[11],
+                    range_max=row[12],
+                    bin_width_override=row[13],
+                    bin_width_computed=row[14],
+                    mean=row[15],
+                    median=row[16],
+                    lower_quartile=row[17],
+                    upper_quartile=row[18],
+                    is_temporal=bool(row[19]) if row[19] is not None else None,
+                    is_featured=bool(row[20]) if row[20] is not None else None,
+                    is_merge_key=bool(row[21]) if row[21] is not None else None,
+                    impute_zero=bool(row[22]) if row[22] is not None else None,
+                    is_repeated=bool(row[23]) if row[23] is not None else None,
+                    variable_spec_to_impute_zeroes_for=row[24],
+                    has_study_dependent_vocabulary=bool(row[25]) if row[25] is not None else None,
+                    weighting_variable_spec=row[26],
+                    has_values=bool(row[27]) if row[27] is not None else None,
+                    data_type=row[28],
+                    data_shape=row[29],
+                    distinct_values_count=row[30],
+                    is_multi_valued=bool(row[31]) if row[31] is not None else None,
+                    unit=row[32],
+                    scale=row[33],
+                    precision=row[34]
                 ))
 
             return variables
@@ -238,14 +316,27 @@ class EdaDatabase:
             )
             attribute_ids = [row[0] for row in result.fetchall()]
 
-            # Build pivot query using CASE statements
+            # Determine aggregation function based on database type
+            db_type = self.config.get("type", "oracle")
+            if db_type == "oracle":
+                # Oracle uses LISTAGG
+                agg_template = """
+                    LISTAGG(CASE WHEN av.attribute_stable_id = '{attr_id}'
+                        THEN COALESCE(av.string_value, CAST(av.number_value AS VARCHAR(50)), TO_CHAR(av.date_value, 'YYYY-MM-DD'))
+                    END, ';') WITHIN GROUP (ORDER BY COALESCE(av.string_value, CAST(av.number_value AS VARCHAR(50)), TO_CHAR(av.date_value, 'YYYY-MM-DD'))) AS "{attr_id}"
+                """
+            else:
+                # PostgreSQL uses STRING_AGG
+                agg_template = """
+                    STRING_AGG(CASE WHEN av.attribute_stable_id = '{attr_id}'
+                        THEN COALESCE(av.string_value, CAST(av.number_value AS VARCHAR), TO_CHAR(av.date_value, 'YYYY-MM-DD'))
+                    END, ';' ORDER BY COALESCE(av.string_value, CAST(av.number_value AS VARCHAR), TO_CHAR(av.date_value, 'YYYY-MM-DD'))) AS "{attr_id}"
+                """
+
+            # Build pivot query using CASE statements with aggregation
             pivot_cols = []
             for attr_id in attribute_ids:
-                pivot_cols.append(f"""
-                    MAX(CASE WHEN av.attribute_stable_id = '{attr_id}'
-                        THEN COALESCE(av.string_value, CAST(av.number_value AS VARCHAR(50)), TO_CHAR(av.date_value, 'YYYY-MM-DD'))
-                    END) AS "{attr_id}"
-                """)
+                pivot_cols.append(agg_template.format(attr_id=attr_id))
 
             pivot_sql = ",\n".join(pivot_cols) if pivot_cols else "''"
 
