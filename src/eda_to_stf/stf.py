@@ -179,8 +179,28 @@ def generate_entity_yaml(
     """Generate entity-<name>.yaml content."""
     entity_name = entity_name_for_stf(entity)
 
-    # Build set of entity stable_ids in the hierarchy (for filtering parent references)
+    # A parent_category must resolve to a variable or category in this same
+    # entity; EDA parents pointing outside it would fail STF validation.
+    # Parents that are entities are the normal top of the tree, not an error.
+    local_stable_ids = {v.stable_id for v in variables}
     entity_ids_in_hierarchy = {entity.stable_id} | {a.stable_id for a in ancestors}
+
+    def resolve_parent(var: Variable) -> str | None:
+        parent = var.parent_stable_id
+        if not parent or parent in local_stable_ids:
+            return parent
+        if parent in entity_ids_in_hierarchy:
+            return None
+        if warnings is not None:
+            warnings.append(ConversionWarning(
+                entity=entity_name,
+                variable=var.stable_id,
+                message=(
+                    f"parent_category '{parent}' is not defined in this entity; "
+                    f"reference dropped"
+                ),
+            ))
+        return None
 
     # Build id_columns - ancestors first, then self
     id_columns = []
@@ -217,9 +237,9 @@ def generate_entity_yaml(
             if var.definition:
                 cat_entry["definition"] = var.definition
 
-            # Only set parent_category if parent is another variable/category, not any entity in the hierarchy
-            if var.parent_stable_id and var.parent_stable_id not in entity_ids_in_hierarchy:
-                cat_entry["parent_category"] = var.parent_stable_id
+            parent_category = resolve_parent(var)
+            if parent_category:
+                cat_entry["parent_category"] = parent_category
 
             # Display metadata for categories
             if var.display_order is not None:
@@ -257,9 +277,9 @@ def generate_entity_yaml(
             if var.definition:
                 var_entry["definition"] = var.definition
 
-            # Only set parent_category if parent is another variable/category, not any entity in the hierarchy
-            if var.parent_stable_id and var.parent_stable_id not in entity_ids_in_hierarchy:
-                var_entry["parent_category"] = var.parent_stable_id
+            parent_category = resolve_parent(var)
+            if parent_category:
+                var_entry["parent_category"] = parent_category
 
             # Ordinals carry levels; other factors carry a sort order
             if ordinal_levels:
@@ -321,10 +341,11 @@ def generate_entity_yaml(
     result: dict[str, Any] = {
         "name": entity_name,
         "display_name": entity.display_name,
-        "display_name_plural": entity.display_name_plural,
-        "id_columns": id_columns,
-        "variables": var_list,
     }
+    if entity.display_name_plural:
+        result["display_name_plural"] = entity.display_name_plural
+    result["id_columns"] = id_columns
+    result["variables"] = var_list
 
     # Only include categories section if there are category-only variables
     if categories_list:

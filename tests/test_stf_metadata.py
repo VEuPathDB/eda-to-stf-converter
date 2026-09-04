@@ -235,3 +235,53 @@ class TestEntityNaming:
             "EUPATH_0000609.id \\\\ Descriptors",
             "OBI_0001169",
         ]
+
+
+class TestLoaderCompatibility:
+    def test_null_display_name_plural_is_omitted(self):
+        entity = make_entity(display_name_plural=None)
+        result = generate_entity_yaml(entity, [], [])
+        assert "display_name_plural" not in result
+
+    def test_display_name_plural_kept_when_present(self):
+        entity = make_entity(display_name_plural="Participants")
+        result = generate_entity_yaml(entity, [], [])
+        assert result["display_name_plural"] == "Participants"
+
+    def test_parent_category_dropped_when_not_in_this_entity(self):
+        entity = make_entity()
+        var = make_var(
+            stable_id="EUPATH_0000587",
+            provider_label='["x"]',
+            parent_stable_id="EUPATH_0035127",
+        )
+        warnings: list = []
+        result = generate_entity_yaml(entity, [var], [], warnings=warnings)
+        assert "parent_category" not in result["variables"][0]
+        assert len(warnings) == 1
+        assert "EUPATH_0035127" in warnings[0].message
+
+    def test_parent_category_kept_when_defined_in_this_entity(self):
+        entity = make_entity()
+        parent = make_var(stable_id="CAT1", has_values=False)
+        child = make_var(
+            stable_id="V1", provider_label='["x"]', parent_stable_id="CAT1"
+        )
+        result = generate_entity_yaml(entity, [parent, child], [])
+        assert result["variables"][0]["parent_category"] == "CAT1"
+
+    def test_category_parent_also_validated(self):
+        entity = make_entity()
+        cat = make_var(
+            stable_id="CAT1", has_values=False, parent_stable_id="MISSING"
+        )
+        result = generate_entity_yaml(entity, [cat], [])
+        assert "parent_category" not in result["categories"][0]
+
+    def test_entity_parent_dropped_without_warning(self):
+        entity = make_entity(stable_id="E1")
+        var = make_var(provider_label='["x"]', parent_stable_id="E1")
+        warnings: list = []
+        result = generate_entity_yaml(entity, [var], [], warnings=warnings)
+        assert "parent_category" not in result["variables"][0]
+        assert warnings == []
