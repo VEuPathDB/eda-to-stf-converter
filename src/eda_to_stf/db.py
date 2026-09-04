@@ -69,6 +69,22 @@ class Variable:
     precision: int | None
 
 
+@dataclass
+class Collection:
+    """EDA variable collection, anchored on a variable category."""
+    stable_id: str
+    display_name: str | None
+    num_members: int | None
+    member: str | None
+    member_plural: str | None
+    is_proportion: bool | None
+    is_compositional: bool | None
+    impute_zero: bool | None
+    normalization_method: str | None
+    display_range_min: str | None
+    display_range_max: str | None
+
+
 def build_connection_url(config: dict) -> str:
     """Build SQLAlchemy connection URL from config.
 
@@ -283,6 +299,108 @@ class EdaDatabase:
 
             return variables
 
+    def _table_exists(self, table_name: str) -> bool:
+        """Check a dataset-specific table exists.
+
+        entitytypegraph.has_attribute_collections is set for at least one entity
+        whose tables were never built, so the flag alone is not enough.
+        """
+        schema, _, name = table_name.partition(".")
+
+        with self._engine.connect() as conn:
+            if self.config.get("type", "oracle") == "oracle":
+                result = conn.execute(
+                    text("""
+                        SELECT 1 FROM all_tables
+                        WHERE owner = :owner AND table_name = :table_name
+                    """),
+                    {"owner": schema.upper(), "table_name": name.upper()},
+                )
+            else:
+                result = conn.execute(
+                    text("""
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = :owner AND table_name = :table_name
+                    """),
+                    {"owner": schema.lower(), "table_name": name.lower()},
+                )
+
+            return result.fetchone() is not None
+
+    def get_collections(
+        self, study_abbrev: str, entity_abbrev: str
+    ) -> list[Collection]:
+        """Fetch variable collections from the entity's collection table."""
+        table_name = f"eda.collection_{study_abbrev}_{entity_abbrev}"
+
+        if not self._table_exists(table_name):
+            return []
+
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                text(f"""
+                    SELECT
+                        stable_id,
+                        display_name,
+                        num_members,
+                        member,
+                        member_plural,
+                        is_proportion,
+                        is_compositional,
+                        impute_zero,
+                        normalization_method,
+                        display_range_min,
+                        display_range_max
+                    FROM {table_name}
+                    ORDER BY stable_id
+                """)
+            )
+
+            return [
+                Collection(
+                    stable_id=row[0],
+                    display_name=row[1],
+                    num_members=row[2],
+                    member=row[3],
+                    member_plural=row[4],
+                    is_proportion=bool(row[5]) if row[5] is not None else None,
+                    is_compositional=bool(row[6]) if row[6] is not None else None,
+                    impute_zero=bool(row[7]) if row[7] is not None else None,
+                    normalization_method=row[8],
+                    display_range_min=row[9],
+                    display_range_max=row[10],
+                )
+                for row in result.fetchall()
+            ]
+
+    def get_collection_members(
+        self, study_abbrev: str, entity_abbrev: str
+    ) -> dict[str, set[str]] | None:
+        """Fetch declared collection membership, keyed by collection stable_id.
+
+        Returns None when the table is absent. STF can only express membership
+        as parent_category, so this is read to check that EDA's explicit
+        membership agrees rather than to build the output from.
+        """
+        table_name = f"eda.collectionattribute_{study_abbrev}_{entity_abbrev}"
+
+        if not self._table_exists(table_name):
+            return None
+
+        members: dict[str, set[str]] = {}
+
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                text(f"""
+                    SELECT collection_stable_id, attribute_stable_id
+                    FROM {table_name}
+                """)
+            )
+            for collection_id, attribute_id in result:
+                members.setdefault(collection_id, set()).add(attribute_id)
+
+        return members
+
     def get_entity_data(
         self,
         study_abbrev: str,
@@ -340,22 +458,33 @@ class EdaDatabase:
 
             pivot_sql = ",\n".join(pivot_cols) if pivot_cols else "''"
 
-            # Build ancestor columns and join
-            if ancestor_abbrevs:
-                ancestors_table = f"eda.ancestors_{study_abbrev}_{entity_abbrev}"
+            # The ancestors table is the authoritative row set: it holds every
+            # entity instance, while attributevalue only holds those that have
+            # at least one value. Driving from attributevalue silently drops
+            # instances and breaks the parent-child join on the way back in.
+            ancestors_table = f"eda.ancestors_{study_abbrev}_{entity_abbrev}"
+            has_ancestors_table = self._table_exists(ancestors_table)
+
+            if has_ancestors_table:
                 ancestor_cols = [f"anc.{abbrev}_STABLE_ID" for abbrev in ancestor_abbrevs]
-                ancestor_select = ", ".join(ancestor_cols) + ","
+                ancestor_select = ", ".join(ancestor_cols) + "," if ancestor_cols else ""
+                group_by_cols = ancestor_cols + [f"anc.{entity_id_column}"]
 
                 query = f"""
                     SELECT {ancestor_select}
-                        av.{entity_id_column},
+                        anc.{entity_id_column},
                         {pivot_sql}
-                    FROM {attr_table} av
-                    LEFT JOIN {ancestors_table} anc ON av.{entity_id_column} = anc.{entity_id_column}
-                    GROUP BY {", ".join(ancestor_cols)}, av.{entity_id_column}
-                    ORDER BY av.{entity_id_column}
+                    FROM {ancestors_table} anc
+                    LEFT JOIN {attr_table} av
+                        ON av.{entity_id_column} = anc.{entity_id_column}
+                    GROUP BY {", ".join(group_by_cols)}
+                    ORDER BY anc.{entity_id_column}
                 """
-                columns = [f"{abbrev}_STABLE_ID" for abbrev in ancestor_abbrevs] + [entity_id_column] + attribute_ids
+                columns = (
+                    [f"{abbrev}_STABLE_ID" for abbrev in ancestor_abbrevs]
+                    + [entity_id_column]
+                    + attribute_ids
+                )
             else:
                 query = f"""
                     SELECT av.{entity_id_column},

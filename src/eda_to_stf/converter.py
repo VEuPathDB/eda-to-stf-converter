@@ -66,8 +66,22 @@ def convert_study(
         if verbose:
             print(f"    Found {len(variables)} variables")
 
+        collections = []
+        collection_members = None
+        if entity.has_attribute_collections:
+            collections = db.get_collections(
+                study.internal_abbrev, entity.internal_abbrev
+            )
+            collection_members = db.get_collection_members(
+                study.internal_abbrev, entity.internal_abbrev
+            )
+            if verbose:
+                print(f"    Found {len(collections)} collections")
+
         # Write entity YAML
-        writer.write_entity_yaml(entity, variables, ancestors)
+        writer.write_entity_yaml(
+            entity, variables, ancestors, collections, collection_members
+        )
 
         # Get entity data (pivoted to wide format)
         # Pass ancestor abbreviations for joining with ancestors table

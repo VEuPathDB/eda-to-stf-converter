@@ -1,12 +1,13 @@
 """Tests for STF metadata fidelity: categories, shapes, JSON fields, naming."""
 
-from eda_to_stf.db import Entity, Study, Variable
+from eda_to_stf.db import Collection, Entity, Study, Variable
 from eda_to_stf.stf import (
     entity_name_for_stf,
     generate_entity_tsv_header,
     generate_entity_yaml,
     generate_study_yaml,
     normalize_shape,
+    StfWriter,
     parse_json_list,
 )
 
@@ -284,4 +285,208 @@ class TestLoaderCompatibility:
         warnings: list = []
         result = generate_entity_yaml(entity, [var], [], warnings=warnings)
         assert "parent_category" not in result["variables"][0]
+        assert warnings == []
+
+
+def make_collection(**kwargs) -> Collection:
+    defaults = dict(
+        stable_id="EUPATH_0009251",
+        display_name="Kingdom",
+        num_members=18,
+        member="taxon",
+        member_plural="taxa",
+        is_proportion=True,
+        is_compositional=True,
+        impute_zero=False,
+        normalization_method="sumToUnity",
+        display_range_min=None,
+        display_range_max=None,
+    )
+    defaults.update(kwargs)
+    return Collection(**defaults)
+
+
+class TestCollections:
+    def test_collection_is_emitted_against_its_category(self):
+        entity = make_entity()
+        category = make_var(stable_id="EUPATH_0009251", has_values=False)
+        member = make_var(
+            stable_id="EUPATH_0009251_Bacteria",
+            parent_stable_id="EUPATH_0009251",
+            data_type="number",
+            data_shape="continuous",
+        )
+        result = generate_entity_yaml(
+            entity, [category, member], [], collections=[make_collection()]
+        )
+
+        assert len(result["collections"]) == 1
+        collection = result["collections"][0]
+        assert collection["category"] == "EUPATH_0009251"
+        assert collection["stable_id"] == "EUPATH_0009251"
+        assert collection["display_name"] == "Kingdom"
+        assert collection["member"] == "taxon"
+        assert collection["member_plural"] == "taxa"
+        assert collection["is_proportion"] is True
+        assert collection["is_compositional"] is True
+        assert collection["impute_zero"] is False
+        assert collection["normalization_method"] == "sumToUnity"
+
+    def test_no_collections_key_when_none(self):
+        entity = make_entity()
+        result = generate_entity_yaml(entity, [], [], collections=[])
+        assert "collections" not in result
+
+    def test_literal_null_normalization_method_is_omitted(self):
+        entity = make_entity()
+        category = make_var(stable_id="EUPATH_0009251", has_values=False)
+        result = generate_entity_yaml(
+            entity,
+            [category],
+            [],
+            collections=[make_collection(normalization_method="NULL")],
+        )
+        assert "normalization_method" not in result["collections"][0]
+
+    def test_empty_normalization_method_is_omitted(self):
+        entity = make_entity()
+        category = make_var(stable_id="EUPATH_0009251", has_values=False)
+        result = generate_entity_yaml(
+            entity,
+            [category],
+            [],
+            collections=[make_collection(normalization_method=None)],
+        )
+        assert "normalization_method" not in result["collections"][0]
+
+    def test_display_ranges_kept_when_set(self):
+        entity = make_entity()
+        category = make_var(stable_id="EUPATH_0009251", has_values=False)
+        result = generate_entity_yaml(
+            entity,
+            [category],
+            [],
+            collections=[make_collection(display_range_min="0", display_range_max="1")],
+        )
+        assert result["collections"][0]["display_range_min"] == "0"
+        assert result["collections"][0]["display_range_max"] == "1"
+
+    def test_collection_without_a_category_is_dropped_and_logged(self):
+        entity = make_entity()
+        warnings: list = []
+        result = generate_entity_yaml(
+            entity, [], [], collections=[make_collection()], warnings=warnings
+        )
+        assert "collections" not in result
+        assert len(warnings) == 1
+        assert warnings[0].variable == "EUPATH_0009251"
+        assert "no matching variable category" in warnings[0].message
+
+
+class TestYamlBooleanTrap:
+    """R's YAML 1.1 parser reads bare Y/N/yes/no/on/off as logicals."""
+
+    def test_risky_strings_are_quoted(self, tmp_path):
+        entity = make_entity()
+        var = make_var(
+            provider_label='["x"]',
+            data_shape="categorical",
+            vocabulary='["Y", "N"]',
+        )
+        writer = StfWriter(tmp_path)
+        path = writer.write_entity_yaml(entity, [var], [])
+        text = path.read_text()
+
+        assert "- 'Y'" in text
+        assert "- 'N'" in text
+        assert "\n  - Y\n" not in text
+
+    def test_round_trips_as_strings(self, tmp_path):
+        entity = make_entity()
+        var = make_var(
+            provider_label='["x"]',
+            data_shape="categorical",
+            vocabulary='["Y", "no", "off", "TRUE"]',
+        )
+        writer = StfWriter(tmp_path)
+        path = writer.write_entity_yaml(entity, [var], [])
+
+        import yaml as pyyaml
+        loaded = pyyaml.safe_load(path.read_text())
+        assert loaded["variables"][0]["vocabulary_order"] == ["Y", "no", "off", "TRUE"]
+
+    def test_ordinary_strings_are_not_quoted(self, tmp_path):
+        entity = make_entity()
+        var = make_var(provider_label='["x"]', display_name="Country")
+        writer = StfWriter(tmp_path)
+        path = writer.write_entity_yaml(entity, [var], [])
+        assert "display_name: Country" in path.read_text()
+
+
+class TestCollectionMembership:
+    """STF expresses membership only as parent_category, so EDA's explicit
+    membership table must be checked to agree rather than assumed to."""
+
+    def _entity_with_members(self, member_ids):
+        category = make_var(stable_id="EUPATH_0009251", has_values=False)
+        members = [
+            make_var(stable_id=m, parent_stable_id="EUPATH_0009251",
+                     data_type="number", data_shape="continuous")
+            for m in member_ids
+        ]
+        return make_entity(), [category, *members]
+
+    def test_agreeing_membership_produces_no_warning(self):
+        entity, variables = self._entity_with_members(["A", "B"])
+        warnings: list = []
+        generate_entity_yaml(
+            entity, variables, [],
+            warnings=warnings,
+            collections=[make_collection()],
+            collection_members={"EUPATH_0009251": {"A", "B"}},
+        )
+        assert warnings == []
+
+    def test_member_missing_from_parent_links_is_reported(self):
+        entity, variables = self._entity_with_members(["A"])
+        warnings: list = []
+        generate_entity_yaml(
+            entity, variables, [],
+            warnings=warnings,
+            collections=[make_collection()],
+            collection_members={"EUPATH_0009251": {"A", "B"}},
+        )
+        assert len(warnings) == 1
+        assert "B" in warnings[0].message
+
+    def test_extra_member_from_parent_links_is_reported(self):
+        entity, variables = self._entity_with_members(["A", "B"])
+        warnings: list = []
+        generate_entity_yaml(
+            entity, variables, [],
+            warnings=warnings,
+            collections=[make_collection()],
+            collection_members={"EUPATH_0009251": {"A"}},
+        )
+        assert len(warnings) == 1
+        assert "B" in warnings[0].message
+
+    def test_collection_still_emitted_when_membership_diverges(self):
+        entity, variables = self._entity_with_members(["A"])
+        result = generate_entity_yaml(
+            entity, variables, [],
+            collections=[make_collection()],
+            collection_members={"EUPATH_0009251": {"A", "B"}},
+        )
+        assert len(result["collections"]) == 1
+
+    def test_no_check_when_membership_unavailable(self):
+        entity, variables = self._entity_with_members(["A"])
+        warnings: list = []
+        generate_entity_yaml(
+            entity, variables, [],
+            warnings=warnings,
+            collections=[make_collection()],
+            collection_members=None,
+        )
         assert warnings == []

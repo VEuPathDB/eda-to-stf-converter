@@ -8,10 +8,30 @@ from typing import Any
 
 import yaml
 
-from .db import Entity, Study, Variable
+from .db import Collection, Entity, Study, Variable
 
 # Delimiter used by db.get_entity_data when concatenating multi-valued attributes
 MULTI_VALUE_DELIMITER = ";"
+
+# YAML 1.1 readers (R's yaml package among them) resolve these bare words to
+# booleans. PyYAML uses the narrower 1.2 set, so it would emit them unquoted
+# and a vocabulary of "Y" would load back as TRUE.
+_YAML_11_BOOLEANS = frozenset(
+    "y Y yes Yes YES n N no No NO "
+    "true True TRUE false False FALSE on On ON off Off OFF".split()
+)
+
+
+class StfDumper(yaml.SafeDumper):
+    """YAML dumper that quotes strings other parsers would read as booleans."""
+
+
+def _represent_str(dumper: yaml.SafeDumper, data: str):
+    style = "'" if data in _YAML_11_BOOLEANS else None
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+StfDumper.add_representer(str, _represent_str)
 
 
 def entity_name_for_stf(entity: Entity) -> str:
@@ -170,11 +190,48 @@ class ConversionWarning:
     message: str
 
 
+def generate_collection_entry(collection: Collection) -> dict:
+    """Build one STF collections entry.
+
+    Fields EDA derives from the member variables (num_members, data_type,
+    data_shape, unit, precision, range_min, range_max) are left out; STF
+    recomputes them on load.
+    """
+    entry: dict[str, Any] = {
+        "category": collection.stable_id,
+        "stable_id": collection.stable_id,
+        "display_name": collection.display_name,
+        "member": collection.member,
+        "member_plural": collection.member_plural,
+    }
+
+    if collection.is_proportion is not None:
+        entry["is_proportion"] = collection.is_proportion
+    if collection.is_compositional is not None:
+        entry["is_compositional"] = collection.is_compositional
+    if collection.impute_zero is not None:
+        entry["impute_zero"] = collection.impute_zero
+
+    # EDA writes the literal string 'NULL' where there is no normalization
+    method = collection.normalization_method
+    if method and method.upper() != "NULL":
+        entry["normalization_method"] = method
+
+    if collection.display_range_min:
+        entry["display_range_min"] = collection.display_range_min
+    if collection.display_range_max:
+        entry["display_range_max"] = collection.display_range_max
+
+    return entry
+
+
 def generate_entity_yaml(
     entity: Entity,
     variables: list[Variable],
     ancestors: list[Entity],
     warnings: list[ConversionWarning] | None = None,
+    collections: list[Collection] | None = None,
+    collection_members: dict[str, set[str]] | None = None,
 ) -> dict:
     """Generate entity-<name>.yaml content."""
     entity_name = entity_name_for_stf(entity)
@@ -351,6 +408,45 @@ def generate_entity_yaml(
     if categories_list:
         result["categories"] = categories_list
 
+    category_ids = {c["category"] for c in categories_list}
+    collections_list = []
+    for collection in collections or []:
+        if collection.stable_id not in category_ids:
+            if warnings is not None:
+                warnings.append(ConversionWarning(
+                    entity=entity_name,
+                    variable=collection.stable_id,
+                    message=(
+                        "collection has no matching variable category in this "
+                        "entity; collection dropped"
+                    ),
+                ))
+            continue
+        if collection_members is not None and warnings is not None:
+            declared = collection_members.get(collection.stable_id, set())
+            from_parent_links = {
+                v.stable_id
+                for v in variables
+                if v.parent_stable_id == collection.stable_id and v.has_values
+            }
+            if declared != from_parent_links:
+                missing = sorted(declared - from_parent_links)
+                extra = sorted(from_parent_links - declared)
+                warnings.append(ConversionWarning(
+                    entity=entity_name,
+                    variable=collection.stable_id,
+                    message=(
+                        "collection membership disagrees with parent_category "
+                        f"links (only in collectionattribute: {missing or '-'}; "
+                        f"only in parent links: {extra or '-'})"
+                    ),
+                ))
+
+        collections_list.append(generate_collection_entry(collection))
+
+    if collections_list:
+        result["collections"] = collections_list
+
     # Add EDA-specific fields as comments/extensions
     if entity.description:
         result["description"] = entity.description
@@ -408,7 +504,10 @@ class StfWriter:
         path = self.output_dir / "study.yaml"
 
         with open(path, "w") as f:
-            yaml.dump(content, f, default_flow_style=False, sort_keys=False)
+            yaml.dump(
+                content, f, Dumper=StfDumper,
+                default_flow_style=False, sort_keys=False,
+            )
 
         return path
 
@@ -416,15 +515,23 @@ class StfWriter:
         self,
         entity: Entity,
         variables: list[Variable],
-        ancestors: list[Entity]
+        ancestors: list[Entity],
+        collections: list[Collection] | None = None,
+        collection_members: dict[str, set[str]] | None = None,
     ) -> Path:
         """Write entity-<name>.yaml file."""
-        content = generate_entity_yaml(entity, variables, ancestors, self.warnings)
+        content = generate_entity_yaml(
+            entity, variables, ancestors, self.warnings,
+            collections, collection_members,
+        )
         entity_name = entity_name_for_stf(entity)
         path = self.output_dir / f"entity-{entity_name}.yaml"
 
         with open(path, "w") as f:
-            yaml.dump(content, f, default_flow_style=False, sort_keys=False)
+            yaml.dump(
+                content, f, Dumper=StfDumper,
+                default_flow_style=False, sort_keys=False,
+            )
 
         return path
 
