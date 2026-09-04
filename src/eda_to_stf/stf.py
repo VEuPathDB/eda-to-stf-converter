@@ -15,8 +15,13 @@ MULTI_VALUE_DELIMITER = ";"
 
 
 def entity_name_for_stf(entity: Entity) -> str:
-    """Convert entity to STF-friendly name (lowercase, underscores)."""
-    return entity.internal_abbrev.lower()
+    """STF name for an entity.
+
+    stable_id is the entity's authoritative identity and is unique within a
+    study; internal_abbrev is a display convenience that upstream does not
+    guarantee, and it names the EDA tables rather than the STF files.
+    """
+    return entity.stable_id
 
 
 def map_data_type(eda_type: str | None) -> str:

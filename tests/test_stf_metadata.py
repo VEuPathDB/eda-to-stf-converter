@@ -1,8 +1,11 @@
-"""Tests for STF metadata fidelity: category detection, shape passthrough, JSON fields."""
+"""Tests for STF metadata fidelity: categories, shapes, JSON fields, naming."""
 
-from eda_to_stf.db import Entity, Variable
+from eda_to_stf.db import Entity, Study, Variable
 from eda_to_stf.stf import (
+    entity_name_for_stf,
+    generate_entity_tsv_header,
     generate_entity_yaml,
+    generate_study_yaml,
     normalize_shape,
     parse_json_list,
 )
@@ -180,4 +183,55 @@ class TestVariableFields:
         generate_entity_yaml(entity, [var], [], warnings=warnings)
         assert len(warnings) == 1
         assert warnings[0].variable == "V1"
-        assert warnings[0].entity == "participant"
+        assert warnings[0].entity == "E1"
+
+
+class TestEntityNaming:
+    """STF names come from stable_id; DB table names still use internal_abbrev."""
+
+    def test_entity_name_is_stable_id(self):
+        entity = make_entity(
+            stable_id="EUPATH_0000808",
+            internal_abbrev="ArthropodSpecimenCollectionProcess",
+        )
+        assert entity_name_for_stf(entity) == "EUPATH_0000808"
+
+    def test_yaml_name_and_id_columns_use_stable_id(self):
+        parent = make_entity(stable_id="EUPATH_0000096", internal_abbrev="Participant")
+        child = make_entity(
+            stable_id="EUPATH_0000609",
+            parent_stable_id="EUPATH_0000096",
+            internal_abbrev="Sample",
+        )
+        result = generate_entity_yaml(child, [], [parent])
+
+        assert result["name"] == "EUPATH_0000609"
+        assert [c["id_column"] for c in result["id_columns"]] == [
+            "EUPATH_0000096.id",
+            "EUPATH_0000609.id",
+        ]
+        assert [c["entity_name"] for c in result["id_columns"]] == [
+            "EUPATH_0000096",
+            "EUPATH_0000609",
+        ]
+
+    def test_study_yaml_lists_stable_ids(self):
+        entities = [
+            make_entity(stable_id="EUPATH_0000096", internal_abbrev="Participant"),
+            make_entity(stable_id="EUPATH_0000808", internal_abbrev="Arthropod"),
+        ]
+        study = Study(stable_id="GEMS-1", internal_abbrev="GEMS_1")
+        assert generate_study_yaml(study, entities)["entities"] == [
+            "EUPATH_0000096",
+            "EUPATH_0000808",
+        ]
+
+    def test_tsv_header_uses_stable_ids(self):
+        parent = make_entity(stable_id="EUPATH_0000096", internal_abbrev="Participant")
+        child = make_entity(stable_id="EUPATH_0000609", internal_abbrev="Sample")
+        header = generate_entity_tsv_header(child, [parent], ["OBI_0001169"])
+        assert header == [
+            "EUPATH_0000096.id",
+            "EUPATH_0000609.id \\\\ Descriptors",
+            "OBI_0001169",
+        ]
