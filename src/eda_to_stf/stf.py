@@ -2,12 +2,16 @@
 
 import csv
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from .db import Entity, Study, Variable
+
+# Delimiter used by db.get_entity_data when concatenating multi-valued attributes
+MULTI_VALUE_DELIMITER = ";"
 
 
 def entity_name_for_stf(entity: Entity) -> str:
@@ -44,42 +48,71 @@ def map_data_shape(eda_shape: str | None) -> str:
     return mapping.get(eda_shape.lower(), "categorical")
 
 
-def parse_vocabulary(vocab_json: str | None) -> list | None:
-    """Parse vocabulary JSON field into list for ordinal_levels.
+def parse_json_list(value: str | None) -> list | None:
+    """Parse an EDA JSON-array column into a list of strings.
 
-    Args:
-        vocab_json: JSON string from vocabulary CLOB field
-
-    Returns:
-        List of vocabulary items or None if empty/invalid
+    EDA stores provider_label, hidden and vocabulary as JSON arrays. Values that
+    predate that convention are returned as a single-element list.
     """
-    if not vocab_json:
+    if not value:
         return None
 
     try:
-        vocab = json.loads(vocab_json)
-        if isinstance(vocab, list):
-            return vocab
-        return None
+        parsed = json.loads(value)
     except (json.JSONDecodeError, TypeError):
-        return None
+        return [value.strip()] if value.strip() else None
+
+    if isinstance(parsed, list):
+        items = [str(item) for item in parsed]
+        return items or None
+    return [str(parsed)]
 
 
-def parse_hidden(hidden_str: str | None) -> list | None:
-    """Parse hidden field into list.
+def normalize_shape(
+    data_type: str | None,
+    data_shape: str | None,
+    vocabulary: list | None,
+) -> tuple[str, str, list | None, list | None, str | None]:
+    """Resolve STF data_type/data_shape/vocabulary from EDA metadata.
 
-    Args:
-        hidden_str: Comma-separated string or single value
+    EDA's data_shape already encodes ordinal_values and force_string_type, so it
+    is passed through rather than re-inferred. STF requires ordinal variables to
+    carry levels and to be integer or string; annotation that violates either is
+    demoted so the study still loads.
 
     Returns:
-        List of hidden contexts or None if empty
+        (data_type, data_shape, ordinal_levels, vocabulary_order, warning)
     """
-    if not hidden_str:
-        return None
+    stf_type = map_data_type(data_type)
+    stf_shape = map_data_shape(data_shape)
 
-    # Split by comma and strip whitespace
-    items = [item.strip() for item in hidden_str.split(',') if item.strip()]
-    return items if items else None
+    if stf_shape != "ordinal":
+        vocab_order = vocabulary if stf_shape in ("categorical", "binary") else None
+        return stf_type, stf_shape, None, vocab_order, None
+
+    if not vocabulary:
+        demoted = "categorical" if stf_type == "string" else "continuous"
+        return (
+            stf_type,
+            demoted,
+            None,
+            None,
+            f"data_shape 'ordinal' with no vocabulary; demoted to '{demoted}'",
+        )
+
+    if stf_type not in ("integer", "string"):
+        return (
+            stf_type,
+            "continuous",
+            None,
+            None,
+            (
+                f"data_shape 'ordinal' is incompatible with data_type "
+                f"'{stf_type}'; demoted to 'continuous' and vocabulary dropped"
+            ),
+        )
+
+    return stf_type, "ordinal", vocabulary, None, None
 
 
 def build_entity_hierarchy(entities: list[Entity]) -> dict[str, list[Entity]]:
@@ -124,10 +157,19 @@ def generate_study_yaml(study: Study, entities: list[Entity]) -> dict:
     }
 
 
+@dataclass
+class ConversionWarning:
+    """An EDA annotation that had to be altered to produce loadable STF."""
+    entity: str
+    variable: str
+    message: str
+
+
 def generate_entity_yaml(
     entity: Entity,
     variables: list[Variable],
-    ancestors: list[Entity]
+    ancestors: list[Entity],
+    warnings: list[ConversionWarning] | None = None,
 ) -> dict:
     """Generate entity-<name>.yaml content."""
     entity_name = entity_name_for_stf(entity)
@@ -155,21 +197,16 @@ def generate_entity_yaml(
         "entity_level": 0
     })
 
-    # Separate category-only variables (no provider_label) from data variables
-    # Category-only variables are organizational containers without actual data
     categories_list = []
     var_list = []
 
     for var in variables:
-        # Variables without provider_label are category-only (organizational)
-        is_category = not var.provider_label
-
-        if is_category:
+        # has_values distinguishes real variables from organizational categories;
+        # provider_label is absent on whole entities' worth of real variables.
+        if not var.has_values:
             cat_entry: dict[str, Any] = {
                 "category": var.stable_id,
                 "display_name": var.display_name or var.stable_id,
-                "data_type": map_data_type(var.data_type),
-                "data_shape": map_data_shape(var.data_shape),
             }
 
             if var.definition:
@@ -185,25 +222,30 @@ def generate_entity_yaml(
             if var.display_type:
                 cat_entry["display_type"] = var.display_type
 
+            hidden_list = parse_json_list(var.hidden)
+            if hidden_list:
+                cat_entry["hidden"] = hidden_list
+
             categories_list.append(cat_entry)
         else:
-            # Ordinal levels from vocabulary - parse first to determine data_shape and data_type
-            ordinal_levels = parse_vocabulary(var.vocabulary)
+            vocabulary = parse_json_list(var.vocabulary)
+            data_type, data_shape, ordinal_levels, vocabulary_order, warning = (
+                normalize_shape(var.data_type, var.data_shape, vocabulary)
+            )
 
-            # If ordinal_levels exists, data_shape should be ordinal and data_type should be string
-            if ordinal_levels:
-                data_shape = "ordinal"
-                data_type = "string"
-            else:
-                data_shape = map_data_shape(var.data_shape)
-                data_type = map_data_type(var.data_type)
+            if warning is not None and warnings is not None:
+                warnings.append(ConversionWarning(
+                    entity=entity_name,
+                    variable=var.stable_id,
+                    message=warning,
+                ))
 
             var_entry: dict[str, Any] = {
                 "variable": var.stable_id,
                 "display_name": var.display_name or var.stable_id,
                 "data_type": data_type,
                 "data_shape": data_shape,
-                "provider_label": [var.provider_label],
+                "provider_label": parse_json_list(var.provider_label) or [],
             }
 
             # Required fields
@@ -214,9 +256,11 @@ def generate_entity_yaml(
             if var.parent_stable_id and var.parent_stable_id not in entity_ids_in_hierarchy:
                 var_entry["parent_category"] = var.parent_stable_id
 
-            # Add ordinal levels if present
+            # Ordinals carry levels; other factors carry a sort order
             if ordinal_levels:
                 var_entry["ordinal_levels"] = ordinal_levels
+            if vocabulary_order:
+                var_entry["vocabulary_order"] = vocabulary_order
 
             # Display metadata
             if var.display_order is not None:
@@ -249,15 +293,15 @@ def generate_entity_yaml(
                 var_entry["is_repeated"] = var.is_repeated
             if var.is_multi_valued is not None:
                 var_entry["is_multi_valued"] = var.is_multi_valued
-            if var.has_values is not None:
-                var_entry["has_values"] = var.has_values
+            if var.is_multi_valued:
+                var_entry["multi_value_delimiter"] = MULTI_VALUE_DELIMITER
             if var.has_study_dependent_vocabulary is not None:
                 var_entry["has_study_dependent_vocabulary"] = var.has_study_dependent_vocabulary
             if var.impute_zero is not None:
                 var_entry["impute_zero"] = var.impute_zero
 
             # Hidden contexts
-            hidden_list = parse_hidden(var.hidden)
+            hidden_list = parse_json_list(var.hidden)
             if hidden_list:
                 var_entry["hidden"] = hidden_list
 
@@ -324,10 +368,13 @@ def generate_entity_tsv_header(
 class StfWriter:
     """Writes STF files to a directory."""
 
+    WARNINGS_FILENAME = "conversion-warnings.log"
+
     def __init__(self, output_dir: Path):
         """Initialize writer with output directory."""
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.warnings: list[ConversionWarning] = []
 
     def write_study_yaml(self, study: Study, entities: list[Entity]):
         """Write study.yaml file."""
@@ -346,7 +393,7 @@ class StfWriter:
         ancestors: list[Entity]
     ) -> Path:
         """Write entity-<name>.yaml file."""
-        content = generate_entity_yaml(entity, variables, ancestors)
+        content = generate_entity_yaml(entity, variables, ancestors, self.warnings)
         entity_name = entity_name_for_stf(entity)
         path = self.output_dir / f"entity-{entity_name}.yaml"
 
@@ -391,5 +438,20 @@ class StfWriter:
             for row in rows:
                 # Data now includes ancestor IDs from the DB query
                 writer.writerow(row)
+
+        return path
+
+    def write_warnings_log(self) -> Path | None:
+        """Write conversion-warnings.log if any annotation was altered."""
+        if not self.warnings:
+            return None
+
+        path = self.output_dir / self.WARNINGS_FILENAME
+
+        with open(path, "w") as f:
+            f.write("entity\tvariable\tmessage\n")
+            f.writelines(
+                f"{w.entity}\t{w.variable}\t{w.message}\n" for w in self.warnings
+            )
 
         return path

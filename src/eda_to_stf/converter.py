@@ -88,6 +88,13 @@ def convert_study(
         if verbose:
             print(f"    Wrote entity-{entity_name}.yaml and entity-{entity_name}.tsv")
 
+    warnings_path = writer.write_warnings_log()
+    if warnings_path:
+        print(
+            f"  {len(writer.warnings)} variable(s) had annotation demoted; "
+            f"see {warnings_path.name}"
+        )
+
     if verbose:
         print(f"STF files written to: {output_dir}")
 
