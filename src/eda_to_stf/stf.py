@@ -2,6 +2,7 @@
 
 import csv
 import json
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,7 @@ import yaml
 
 from .db import Collection, Entity, Study, Variable
 
-# Delimiter used by db.get_entity_data when concatenating multi-valued attributes
+# Delimiter used by db.stream_entity_data when concatenating multi-valued attributes
 MULTI_VALUE_DELIMITER = ";"
 
 # YAML 1.1 readers (R's yaml package among them) resolve these bare words to
@@ -540,17 +541,20 @@ class StfWriter:
         entity: Entity,
         ancestors: list[Entity],
         columns: list[str],
-        rows: list[list],
+        rows: Iterable[Sequence],
         entities_by_id: dict[str, Entity]
-    ) -> Path:
+    ) -> int:
         """Write entity-<name>.tsv file.
 
         Args:
             entity: The entity being written
             ancestors: Ordered list of ancestor entities
             columns: Column names from database (entity_id + attribute_ids)
-            rows: Data rows from database
+            rows: Data rows from database, consumed once in a single pass
             entities_by_id: Map of stable_id -> Entity for looking up parents
+
+        Returns:
+            Number of data rows written.
         """
         entity_name = entity_name_for_stf(entity)
         path = self.output_dir / f"entity-{entity_name}.tsv"
@@ -568,11 +572,13 @@ class StfWriter:
             writer = csv.writer(f, delimiter="\t")
             writer.writerow(headers)
 
+            row_count = 0
             for row in rows:
                 # Data now includes ancestor IDs from the DB query
                 writer.writerow(row)
+                row_count += 1
 
-        return path
+        return row_count
 
     def write_warnings_log(self) -> Path | None:
         """Write conversion-warnings.log if any annotation was altered."""

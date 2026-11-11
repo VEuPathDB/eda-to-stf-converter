@@ -1,10 +1,15 @@
 """Database access layer for EDA schema using SQLAlchemy."""
 
 import os
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+
+ENTITY_ROW_BATCH_SIZE = 10_000
 
 
 @dataclass
@@ -83,6 +88,12 @@ class Collection:
     normalization_method: str | None
     display_range_min: str | None
     display_range_max: str | None
+
+
+def stream_rows(result: Any) -> Iterator[Sequence]:
+    """Yield rows one server-side batch at a time; never the whole result."""
+    for batch in result.partitions(ENTITY_ROW_BATCH_SIZE):
+        yield from batch
 
 
 def build_connection_url(config: dict) -> str:
@@ -401,22 +412,25 @@ class EdaDatabase:
 
         return members
 
-    def get_entity_data(
+    @contextmanager
+    def stream_entity_data(
         self,
         study_abbrev: str,
         entity_abbrev: str,
         ancestor_abbrevs: list[str] | None = None,
-    ) -> tuple[list[str], list[list]]:
-        """Fetch entity data from attributevalue table, pivoted to wide format.
+    ) -> Iterator[tuple[list[str], Iterator[Sequence]]]:
+        """Stream entity data from attributevalue table, pivoted to wide format.
 
         Args:
             study_abbrev: Study internal abbreviation
             entity_abbrev: Entity internal abbreviation
             ancestor_abbrevs: List of ancestor entity abbreviations (parent first, then grandparent, etc.)
 
-        Returns:
+        Yields:
             Tuple of (column_names, rows) where data is pivoted to wide format.
             Columns are: [ancestor_ids..., entity_id, attribute_ids...]
+            Rows come from a server-side cursor that is valid only inside the
+            ``with`` block, which holds the connection open while it is read.
         """
         attr_table = f"eda.attributevalue_{study_abbrev}_{entity_abbrev}"
         entity_id_column = f"{entity_abbrev}_STABLE_ID"
@@ -495,7 +509,10 @@ class EdaDatabase:
                 """
                 columns = [entity_id_column] + attribute_ids
 
-            result = conn.execute(text(query))
-            rows = [list(row) for row in result.fetchall()]
-
-        return columns, rows
+            result = conn.execution_options(
+                stream_results=True, yield_per=ENTITY_ROW_BATCH_SIZE
+            ).execute(text(query))
+            try:
+                yield columns, stream_rows(result)
+            finally:
+                result.close()

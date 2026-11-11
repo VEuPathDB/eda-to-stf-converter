@@ -86,17 +86,17 @@ def convert_study(
         # Get entity data (pivoted to wide format)
         # Pass ancestor abbreviations for joining with ancestors table
         ancestor_abbrevs = [a.internal_abbrev for a in ancestors]
-        columns, rows = db.get_entity_data(
+        with db.stream_entity_data(
             study.internal_abbrev,
             entity.internal_abbrev,
-            ancestor_abbrevs=ancestor_abbrevs if ancestors else None
-        )
+            ancestor_abbrevs=ancestor_abbrevs if ancestors else None,
+        ) as (columns, rows):
+            row_count = writer.write_entity_tsv(
+                entity, ancestors, columns, rows, entities_by_id
+            )
 
         if verbose:
-            print(f"    Found {len(rows)} data rows")
-
-        # Write entity TSV
-        writer.write_entity_tsv(entity, ancestors, columns, rows, entities_by_id)
+            print(f"    Found {row_count} data rows")
 
         entity_name = entity_name_for_stf(entity)
         if verbose:
