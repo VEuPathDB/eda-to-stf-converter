@@ -1,6 +1,9 @@
 """Tests for STF metadata fidelity: categories, shapes, JSON fields, naming."""
 
-from eda_to_stf.db import Collection, Entity, Study, Variable
+import yaml
+
+from eda_to_stf.converter import orphan_warnings
+from eda_to_stf.db import Collection, Entity, Study, Variable, orphan_variable
 from eda_to_stf.stf import (
     entity_name_for_stf,
     generate_entity_tsv_header,
@@ -490,3 +493,65 @@ class TestCollectionMembership:
             collection_members=None,
         )
         assert warnings == []
+
+
+class TestOrphanAttributes:
+    """Attributes with values but no attributegraph row become hidden variables."""
+
+    def test_written_as_hidden_string_variable(self, tmp_path):
+        orphan, notes = orphan_variable(
+            "ENVO_00000005", True, False, False, "Administrative region, level 1"
+        )
+        warnings: list = []
+        writer = StfWriter(tmp_path)
+        writer.warnings = warnings
+        path = writer.write_entity_yaml(make_entity(), [orphan], [])
+
+        entry = yaml.safe_load(path.read_text())["variables"][0]
+        assert entry["variable"] == "ENVO_00000005"
+        assert entry["display_name"] == "Administrative region, level 1"
+        assert entry["hidden"] == ["everywhere"]
+        assert entry["data_type"] == "string"
+        assert entry["data_shape"] == "categorical"
+        assert "parent_category" not in entry
+        assert notes == []
+        assert warnings == []
+
+    def test_number_and_date_are_continuous(self):
+        number, _ = orphan_variable("N", False, True, False, "n")
+        date, _ = orphan_variable("D", False, False, True, "d")
+        assert (number.data_type, number.data_shape) == ("number", "continuous")
+        assert (date.data_type, date.data_shape) == ("date", "continuous")
+
+    def test_mixed_value_columns_typed_string_with_warning(self):
+        orphan, notes = orphan_variable("M", True, True, False, "m")
+        assert (orphan.data_type, orphan.data_shape) == ("string", "categorical")
+        assert len(notes) == 1
+        assert "string, number" in notes[0]
+
+    def test_missing_term_falls_back_to_id_with_warning(self):
+        orphan, notes = orphan_variable("X_1", True, False, False, None)
+        assert orphan.display_name == "X_1"
+        assert len(notes) == 1
+        assert "ontologyterm" in notes[0]
+
+    def test_one_warning_per_orphan_plus_its_notes(self):
+        entity = make_entity(stable_id="EUPATH_0000609")
+        named, _ = orphan_variable("A", True, False, False, "country")
+        unnamed, _ = orphan_variable("B", True, False, False, None)
+        warnings = orphan_warnings(
+            entity, [named, unnamed], [("B", "no sres.ontologyterm row")]
+        )
+        assert [(w.entity, w.variable, w.message) for w in warnings] == [
+            (
+                "EUPATH_0000609",
+                "A",
+                "no attributegraph row; written as hidden variable 'country'",
+            ),
+            (
+                "EUPATH_0000609",
+                "B",
+                "no attributegraph row; written as hidden variable 'B'",
+            ),
+            ("EUPATH_0000609", "B", "no sres.ontologyterm row"),
+        ]

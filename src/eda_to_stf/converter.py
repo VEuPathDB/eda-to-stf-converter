@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
-from .db import EdaDatabase, Entity
-from .stf import StfWriter, entity_name_for_stf, get_ancestor_chain
+from .db import EdaDatabase, Entity, Variable
+from .stf import ConversionWarning, StfWriter, entity_name_for_stf, get_ancestor_chain
 
 
 def convert_study(
@@ -63,8 +63,15 @@ def convert_study(
         # Get variables for this entity
         variables = db.get_variables(study.internal_abbrev, entity.internal_abbrev)
 
+        orphan_notes: list[tuple[str, str]] = []
+        orphans = db.get_orphan_attributes(
+            study.internal_abbrev, entity.internal_abbrev, warnings=orphan_notes
+        )
+        variables.extend(orphans)
+        writer.warnings.extend(orphan_warnings(entity, orphans, orphan_notes))
+
         if verbose:
-            print(f"    Found {len(variables)} variables")
+            print(f"    Found {len(variables)} variables ({len(orphans)} orphan)")
 
         collections = []
         collection_members = None
@@ -105,14 +112,46 @@ def convert_study(
     warnings_path = writer.write_warnings_log()
     if warnings_path:
         print(
-            f"  {len(writer.warnings)} variable(s) had annotation demoted; "
-            f"see {warnings_path.name}"
+            f"  {len(writer.warnings)} conversion warning(s) (annotation altered "
+            f"or metadata synthesized); see {warnings_path.name}"
         )
 
     if verbose:
         print(f"STF files written to: {output_dir}")
 
     return output_dir
+
+
+def orphan_warnings(
+    entity: Entity,
+    orphans: list[Variable],
+    notes: list[tuple[str, str]],
+) -> list[ConversionWarning]:
+    """One warning per orphan, plus any note raised while building it."""
+    entity_name = entity_name_for_stf(entity)
+    notes_by_attribute: dict[str, list[str]] = {}
+    for attribute_id, note in notes:
+        notes_by_attribute.setdefault(attribute_id, []).append(note)
+
+    warnings = []
+    for orphan in orphans:
+        warnings.append(
+            ConversionWarning(
+                entity=entity_name,
+                variable=orphan.stable_id,
+                message=(
+                    f"no attributegraph row; written as hidden variable "
+                    f"'{orphan.display_name}'"
+                ),
+            )
+        )
+        warnings.extend(
+            ConversionWarning(
+                entity=entity_name, variable=orphan.stable_id, message=note
+            )
+            for note in notes_by_attribute.get(orphan.stable_id, [])
+        )
+    return warnings
 
 
 def _sort_entities_by_hierarchy(

@@ -96,6 +96,85 @@ def stream_rows(result: Any) -> Iterator[Sequence]:
         yield from batch
 
 
+ORPHAN_HIDDEN = '["everywhere"]'
+
+
+def orphan_variable(
+    attribute_id: str,
+    has_string: bool,
+    has_number: bool,
+    has_date: bool,
+    term_name: str | None,
+) -> tuple[Variable, list[str]]:
+    """Build the hidden Variable for an attribute with no attributegraph row.
+
+    data_type stays in EDA's vocabulary so the writer maps it exactly as it
+    maps attributegraph types. Returns the variable and any warning messages.
+    """
+    notes = []
+
+    populated = [
+        eda_type
+        for eda_type, present in (
+            ("string", has_string),
+            ("number", has_number),
+            ("date", has_date),
+        )
+        if present
+    ]
+    if len(populated) == 1:
+        data_type = populated[0]
+    else:
+        data_type = "string"
+        if len(populated) > 1:
+            notes.append(
+                f"values in more than one column ({', '.join(populated)}); "
+                f"typed as 'string'"
+            )
+
+    if term_name is None:
+        notes.append("no sres.ontologyterm row; display_name is the attribute id")
+
+    variable = Variable(
+        stable_id=attribute_id,
+        parent_stable_id=None,
+        provider_label=None,
+        display_name=term_name or attribute_id,
+        definition=None,
+        vocabulary=None,
+        display_type=None,
+        hidden=ORPHAN_HIDDEN,
+        display_order=None,
+        display_range_min=None,
+        display_range_max=None,
+        range_min=None,
+        range_max=None,
+        bin_width_override=None,
+        bin_width_computed=None,
+        mean=None,
+        median=None,
+        lower_quartile=None,
+        upper_quartile=None,
+        is_temporal=None,
+        is_featured=None,
+        is_merge_key=None,
+        impute_zero=None,
+        is_repeated=None,
+        variable_spec_to_impute_zeroes_for=None,
+        has_study_dependent_vocabulary=None,
+        weighting_variable_spec=None,
+        has_values=True,
+        data_type=data_type,
+        data_shape="categorical" if data_type == "string" else "continuous",
+        distinct_values_count=None,
+        is_multi_valued=None,
+        unit=None,
+        scale=None,
+        precision=None,
+    )
+    return variable, notes
+
+
 def build_connection_url(config: dict) -> str:
     """Build SQLAlchemy connection URL from config.
 
@@ -309,6 +388,61 @@ class EdaDatabase:
                 ))
 
             return variables
+
+    def get_orphan_attributes(
+        self,
+        study_abbrev: str,
+        entity_abbrev: str,
+        warnings: list[tuple[str, str]] | None = None,
+    ) -> list[Variable]:
+        """Variables for attributes that have values but no attributegraph row.
+
+        Without metadata they would be TSV columns STF cannot describe, so each
+        becomes a hidden variable named from its ontology term. Anything worth
+        reporting is appended to ``warnings`` as (attribute_id, message).
+        """
+        attr_table = f"eda.attributevalue_{study_abbrev}_{entity_abbrev}"
+        graph_table = f"eda.attributegraph_{study_abbrev}_{entity_abbrev}"
+
+        # The same SQL runs on Oracle and Postgres. Aggregate before the term
+        # lookup so sres.ontologyterm is probed once per attribute, not per value.
+        query = f"""
+            WITH orphan AS (
+                SELECT av.attribute_stable_id,
+                    MAX(CASE WHEN av.string_value IS NOT NULL THEN 1 ELSE 0 END) AS has_string,
+                    MAX(CASE WHEN av.number_value IS NOT NULL THEN 1 ELSE 0 END) AS has_number,
+                    MAX(CASE WHEN av.date_value IS NOT NULL THEN 1 ELSE 0 END) AS has_date
+                FROM {attr_table} av
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {graph_table} ag
+                    WHERE ag.stable_id = av.attribute_stable_id
+                )
+                GROUP BY av.attribute_stable_id
+            )
+            SELECT o.attribute_stable_id, o.has_string, o.has_number, o.has_date,
+                (SELECT MIN(ot.name) FROM sres.ontologyterm ot
+                 WHERE ot.source_id = o.attribute_stable_id) AS term_name
+            FROM orphan o
+            ORDER BY o.attribute_stable_id
+        """
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(query)).fetchall()
+
+        orphans = []
+        for attribute_id, has_string, has_number, has_date, term_name in rows:
+            orphan, notes = orphan_variable(
+                attribute_id,
+                bool(has_string),
+                bool(has_number),
+                bool(has_date),
+                term_name,
+            )
+            orphans.append(orphan)
+            if warnings is not None:
+                warnings.extend((attribute_id, note) for note in notes)
+
+        return orphans
 
     def _table_exists(self, table_name: str) -> bool:
         """Check a dataset-specific table exists.
