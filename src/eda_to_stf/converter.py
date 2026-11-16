@@ -3,7 +3,12 @@
 from pathlib import Path
 
 from .db import EdaDatabase, Entity
-from .stf import StfWriter, entity_name_for_stf, get_ancestor_chain
+from .stf import (
+    StfWriter,
+    entity_name_for_stf,
+    get_ancestor_chain,
+    value_attribute_ids,
+)
 
 
 def convert_study(
@@ -78,11 +83,6 @@ def convert_study(
             if verbose:
                 print(f"    Found {len(collections)} collections")
 
-        # Write entity YAML
-        writer.write_entity_yaml(
-            entity, variables, ancestors, collections, collection_members
-        )
-
         # Get entity data (pivoted to wide format)
         # Pass ancestor abbreviations for joining with ancestors table
         ancestor_abbrevs = [a.internal_abbrev for a in ancestors]
@@ -91,6 +91,12 @@ def convert_study(
             entity.internal_abbrev,
             ancestor_abbrevs=ancestor_abbrevs if ancestors else None,
         ) as (columns, rows):
+            # The YAML needs the attribute ids that carry values, which are
+            # known only once the pivot columns are.
+            writer.write_entity_yaml(
+                entity, variables, ancestors, collections, collection_members,
+                value_attribute_ids(columns, ancestors),
+            )
             row_count = writer.write_entity_tsv(
                 entity, ancestors, columns, rows, entities_by_id
             )

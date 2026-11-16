@@ -22,6 +22,19 @@ _YAML_11_BOOLEANS = frozenset(
     "true True TRUE false False FALSE on On ON off Off OFF".split()
 )
 
+LATITUDE_STABLE_ID = "OBI_0001620"
+
+# EDA geohash variables, by precision. Some studies carry their values with no
+# attributegraph row; study-wrangler's geo check needs them as geoaggregators.
+GEOHASH_PRECISION_BY_STABLE_ID = {
+    "EUPATH_0043203": 1,
+    "EUPATH_0043204": 2,
+    "EUPATH_0043205": 3,
+    "EUPATH_0043206": 4,
+    "EUPATH_0043207": 5,
+    "EUPATH_0043208": 6,
+}
+
 
 class StfDumper(yaml.SafeDumper):
     """YAML dumper that quotes strings other parsers would read as booleans."""
@@ -55,7 +68,7 @@ def map_data_type(eda_type: str | None) -> str:
         "number": "number",
         "integer": "integer",
         "date": "date",
-        "longitude": "number",
+        "longitude": "longitude",
     }
     return mapping.get(eda_type.lower(), "string")
 
@@ -191,6 +204,25 @@ class ConversionWarning:
     message: str
 
 
+def value_attribute_ids(columns: Sequence[str], ancestors: list[Entity]) -> list[str]:
+    """Attribute ids from stream_entity_data columns: [ancestor_ids..., entity_id, attribute_ids...]."""
+    return list(columns[len(ancestors) + 1:])
+
+
+def generate_geohash_entry(stable_id: str) -> dict:
+    """Variable entry for a geohash attribute that has values but no attributegraph row."""
+    precision = GEOHASH_PRECISION_BY_STABLE_ID[stable_id]
+    return {
+        "variable": stable_id,
+        "stable_id": stable_id,
+        "display_name": f"Geohash (precision {precision})",
+        "data_type": "string",
+        "data_shape": "categorical",
+        "display_type": "geoaggregator",
+        "hidden": ["everywhere"],
+    }
+
+
 def generate_collection_entry(collection: Collection) -> dict:
     """Build one STF collections entry.
 
@@ -233,8 +265,12 @@ def generate_entity_yaml(
     warnings: list[ConversionWarning] | None = None,
     collections: list[Collection] | None = None,
     collection_members: dict[str, set[str]] | None = None,
+    value_ids: Iterable[str] = (),
 ) -> dict:
-    """Generate entity-<name>.yaml content."""
+    """Generate entity-<name>.yaml content.
+
+    value_ids are the attribute ids with values in this entity's attributevalue table.
+    """
     entity_name = entity_name_for_stf(entity)
 
     # A parent_category must resolve to a variable or category in this same
@@ -289,6 +325,7 @@ def generate_entity_yaml(
         if not var.has_values:
             cat_entry: dict[str, Any] = {
                 "category": var.stable_id,
+                "stable_id": var.stable_id,
                 "display_name": var.display_name or var.stable_id,
             }
 
@@ -312,8 +349,11 @@ def generate_entity_yaml(
             categories_list.append(cat_entry)
         else:
             vocabulary = parse_json_list(var.vocabulary)
+            # study-wrangler's geo check requires latitude to be a number;
+            # some EDA studies annotate it as integer.
+            eda_type = "number" if var.stable_id == LATITUDE_STABLE_ID else var.data_type
             data_type, data_shape, ordinal_levels, vocabulary_order, warning = (
-                normalize_shape(var.data_type, var.data_shape, vocabulary)
+                normalize_shape(eda_type, var.data_shape, vocabulary)
             )
 
             if warning is not None and warnings is not None:
@@ -325,6 +365,7 @@ def generate_entity_yaml(
 
             var_entry: dict[str, Any] = {
                 "variable": var.stable_id,
+                "stable_id": var.stable_id,
                 "display_name": var.display_name or var.stable_id,
                 "data_type": data_type,
                 "data_shape": data_shape,
@@ -362,7 +403,15 @@ def generate_entity_yaml(
             # Scale and units
             if var.scale:
                 var_entry["scale"] = var.scale
-            if var.unit:
+            # study-wrangler allows units only on integer and number variables
+            if var.unit and data_type == "longitude":
+                if warnings is not None:
+                    warnings.append(ConversionWarning(
+                        entity=entity_name,
+                        variable=var.stable_id,
+                        message=f"unit '{var.unit}' is not allowed on a longitude; unit dropped",
+                    ))
+            elif var.unit:
                 var_entry["unit"] = var.unit
 
             # Boolean flags
@@ -395,6 +444,23 @@ def generate_entity_yaml(
                 var_entry["variable_spec_to_impute_zeroes_for"] = var.variable_spec_to_impute_zeroes_for
 
             var_list.append(var_entry)
+
+    unannotated_geohash_ids = sorted(
+        (vid for vid in set(value_ids) - local_stable_ids
+         if vid in GEOHASH_PRECISION_BY_STABLE_ID),
+        key=GEOHASH_PRECISION_BY_STABLE_ID.__getitem__,
+    )
+    for geohash_id in unannotated_geohash_ids:
+        var_list.append(generate_geohash_entry(geohash_id))
+        if warnings is not None:
+            warnings.append(ConversionWarning(
+                entity=entity_name,
+                variable=geohash_id,
+                message=(
+                    "geohash has values but no attributegraph row; "
+                    "written as a hidden geoaggregator variable"
+                ),
+            ))
 
     result: dict[str, Any] = {
         "name": entity_name,
@@ -519,11 +585,12 @@ class StfWriter:
         ancestors: list[Entity],
         collections: list[Collection] | None = None,
         collection_members: dict[str, set[str]] | None = None,
+        value_ids: Iterable[str] = (),
     ) -> Path:
         """Write entity-<name>.yaml file."""
         content = generate_entity_yaml(
             entity, variables, ancestors, self.warnings,
-            collections, collection_members,
+            collections, collection_members, value_ids,
         )
         entity_name = entity_name_for_stf(entity)
         path = self.output_dir / f"entity-{entity_name}.yaml"
@@ -559,14 +626,9 @@ class StfWriter:
         entity_name = entity_name_for_stf(entity)
         path = self.output_dir / f"entity-{entity_name}.tsv"
 
-        # Build header - columns from DB are:
-        # [ancestor_ids..., entity_id, attribute_ids...]
-        # We need to rename ID columns and add Descriptors suffix to entity ID
-        num_ancestors = len(ancestors)
-        # Attribute IDs start after ancestor IDs and entity ID
-        attribute_ids = columns[num_ancestors + 1:] if len(columns) > num_ancestors + 1 else []
-
-        headers = generate_entity_tsv_header(entity, ancestors, attribute_ids)
+        headers = generate_entity_tsv_header(
+            entity, ancestors, value_attribute_ids(columns, ancestors)
+        )
 
         with open(path, "w", newline="") as f:
             writer = csv.writer(f, delimiter="\t")
