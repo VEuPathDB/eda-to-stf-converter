@@ -6,6 +6,7 @@ from eda_to_stf.stf import (
     generate_entity_tsv_header,
     generate_entity_yaml,
     generate_study_yaml,
+    map_data_type,
     normalize_shape,
     StfWriter,
     parse_json_list,
@@ -489,4 +490,106 @@ class TestCollectionMembership:
             collections=[make_collection()],
             collection_members=None,
         )
+        assert warnings == []
+
+
+class TestStableIds:
+    """study-wrangler mints VAR_ ids for entries without stable_id."""
+
+    def test_variable_carries_its_attributegraph_stable_id(self):
+        result = generate_entity_yaml(make_entity(), [make_var(stable_id="OBI_0001620")], [])
+        var = result["variables"][0]
+        assert var["stable_id"] == var["variable"] == "OBI_0001620"
+
+    def test_category_carries_its_attributegraph_stable_id(self):
+        category = make_var(stable_id="EUPATH_0000605", has_values=False)
+        result = generate_entity_yaml(make_entity(), [category], [])
+        cat = result["categories"][0]
+        assert cat["stable_id"] == cat["category"] == "EUPATH_0000605"
+
+    def test_entity_stable_id_is_a_top_level_scalar(self):
+        """study-wrangler mints ENT_ ids unless stable_id is a top-level scalar."""
+        result = generate_entity_yaml(make_entity(stable_id="EUPATH_0000096"), [], [])
+        assert result["stable_id"] == "EUPATH_0000096"
+        assert result["_eda_metadata"]["stable_id"] == "EUPATH_0000096"
+
+
+class TestGeoCoordinates:
+    def test_longitude_keeps_its_data_type(self):
+        assert map_data_type("longitude") == "longitude"
+
+    def test_longitude_variable_written_as_longitude(self):
+        var = make_var(stable_id="OBI_0001621", data_type="longitude",
+                       data_shape="continuous")
+        result = generate_entity_yaml(make_entity(), [var], [])
+        assert result["variables"][0]["data_type"] == "longitude"
+
+    def test_longitude_unit_dropped_with_warning(self):
+        var = make_var(stable_id="OBI_0001621", data_type="longitude",
+                       data_shape="continuous", unit="degrees")
+        warnings: list = []
+        result = generate_entity_yaml(make_entity(), [var], [], warnings=warnings)
+        assert "unit" not in result["variables"][0]
+        assert [(w.entity, w.variable) for w in warnings] == [("E1", "OBI_0001621")]
+
+    def test_latitude_keeps_its_unit(self):
+        var = make_var(stable_id="OBI_0001620", data_type="number",
+                       data_shape="continuous", unit="degrees")
+        result = generate_entity_yaml(make_entity(), [var], [])
+        assert result["variables"][0]["unit"] == "degrees"
+
+    def test_integer_latitude_written_as_number(self):
+        var = make_var(stable_id="OBI_0001620", data_type="integer",
+                       data_shape="continuous")
+        result = generate_entity_yaml(make_entity(), [var], [])
+        assert result["variables"][0]["data_type"] == "number"
+
+    def test_other_integer_variables_unchanged(self):
+        var = make_var(stable_id="V1", data_type="integer", data_shape="continuous")
+        result = generate_entity_yaml(make_entity(), [var], [])
+        assert result["variables"][0]["data_type"] == "integer"
+
+
+class TestUnannotatedGeohash:
+    """Geohash values with no attributegraph row become hidden geoaggregators."""
+
+    def test_geohash_with_values_and_no_row_gets_entry(self):
+        warnings: list = []
+        result = generate_entity_yaml(
+            make_entity(), [], [], warnings=warnings,
+            value_ids=["EUPATH_0043205"],
+        )
+        assert result["variables"] == [{
+            "variable": "EUPATH_0043205",
+            "stable_id": "EUPATH_0043205",
+            "display_name": "Geohash (precision 3)",
+            "data_type": "string",
+            "data_shape": "categorical",
+            "display_type": "geoaggregator",
+            "hidden": ["everywhere"],
+        }]
+        assert [(w.entity, w.variable) for w in warnings] == [("E1", "EUPATH_0043205")]
+
+    def test_all_precisions_written_in_precision_order(self):
+        geohash_ids = [f"EUPATH_004320{n}" for n in range(8, 2, -1)]
+        result = generate_entity_yaml(make_entity(), [], [], value_ids=geohash_ids)
+        names = [v["display_name"] for v in result["variables"]]
+        assert names == [f"Geohash (precision {p})" for p in range(1, 7)]
+
+    def test_geohash_with_attributegraph_row_is_not_duplicated(self):
+        annotated = make_var(stable_id="EUPATH_0043203", display_name="Geohash 1")
+        warnings: list = []
+        result = generate_entity_yaml(
+            make_entity(), [annotated], [], warnings=warnings,
+            value_ids=["EUPATH_0043203"],
+        )
+        assert [v["display_name"] for v in result["variables"]] == ["Geohash 1"]
+        assert warnings == []
+
+    def test_other_unannotated_ids_left_alone(self):
+        warnings: list = []
+        result = generate_entity_yaml(
+            make_entity(), [], [], warnings=warnings, value_ids=["ENVO_00000005"],
+        )
+        assert result["variables"] == []
         assert warnings == []
