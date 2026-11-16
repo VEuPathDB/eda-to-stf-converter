@@ -462,8 +462,11 @@ def generate_entity_yaml(
                 ),
             ))
 
+    # study-wrangler reads only top-level scalars into the Entity, so the
+    # stable_id under _eda_metadata alone would leave it minting ENT_ ids.
     result: dict[str, Any] = {
         "name": entity_name,
+        "stable_id": entity.stable_id,
         "display_name": entity.display_name,
     }
     if entity.display_name_plural:

@@ -507,6 +507,12 @@ class TestStableIds:
         cat = result["categories"][0]
         assert cat["stable_id"] == cat["category"] == "EUPATH_0000605"
 
+    def test_entity_stable_id_is_a_top_level_scalar(self):
+        """study-wrangler mints ENT_ ids unless stable_id is a top-level scalar."""
+        result = generate_entity_yaml(make_entity(stable_id="EUPATH_0000096"), [], [])
+        assert result["stable_id"] == "EUPATH_0000096"
+        assert result["_eda_metadata"]["stable_id"] == "EUPATH_0000096"
+
 
 class TestGeoCoordinates:
     def test_longitude_keeps_its_data_type(self):
