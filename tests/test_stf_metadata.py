@@ -217,6 +217,11 @@ class TestEntityNaming:
             "EUPATH_0000609",
         ]
 
+    def test_study_yaml_carries_oracle_study_stable_id(self):
+        study = Study(stable_id="GEMS-1", internal_abbrev="GEMS_1")
+        content = generate_study_yaml(study, [make_entity()])
+        assert content["stable_id"] == content["name"] == "GEMS-1"
+
     def test_study_yaml_lists_stable_ids(self):
         entities = [
             make_entity(stable_id="EUPATH_0000096", internal_abbrev="Participant"),
