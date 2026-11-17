@@ -7,9 +7,12 @@ import yaml
 from eda_to_stf.converter import convert_study
 from eda_to_stf.db import Entity, Study
 
+DB_CONFIG = {"type": "oracle", "host": "localhost", "port": 1521, "name": "db"}
+
 
 class FakeDb:
     def __init__(self, columns, rows):
+        self.config = DB_CONFIG
         self._columns = columns
         self._rows = rows
 
@@ -50,3 +53,13 @@ def test_unannotated_geohash_column_gets_yaml_entry(tmp_path):
     assert [v["variable"] for v in content["variables"]] == ["EUPATH_0043203"]
     warnings_log = (tmp_path / "conversion-warnings.log").read_text()
     assert "EUPATH_0000096\tEUPATH_0043203\t" in warnings_log
+
+
+def test_dump_info_written_beside_study_yaml_not_in_it(tmp_path):
+    convert_study(FakeDb(["Coll_STABLE_ID"], []), "STUDY-1", tmp_path)
+
+    info = yaml.safe_load((tmp_path / "dump-info.yaml").read_text())
+    assert info["study_stable_id"] == "STUDY-1"
+    assert info["database"] == DB_CONFIG
+    study = yaml.safe_load((tmp_path / "study.yaml").read_text())
+    assert not set(info) & set(study)

@@ -38,12 +38,31 @@ pip install -e ".[dev]"
 eda-to-stf --config conf/config.yaml
 ```
 
+## Dump provenance
+
+Each study's output directory gets a `dump-info.yaml` beside `study.yaml`:
+
+| key | value |
+|---|---|
+| `converter_commit` | `EDA_TO_STF_COMMIT` if set, else `git rev-parse HEAD` of the checkout holding the installed package, else `unknown` (with a warning) |
+| `converter_dirty` | `true` if that checkout had uncommitted changes to tracked files; `null` when the commit came from `EDA_TO_STF_COMMIT` or is `unknown` |
+| `converter_version` | package version |
+| `study_stable_id` | the study dumped |
+| `dumped_at` | UTC, ISO 8601 |
+| `database` | `type`, `host`, `port`, `name` from the config; never the user or password |
+
+It is a separate file because study-wrangler passes every top-level `study.yaml` key
+on to the study, and reads only the entity files `study.yaml` lists.
+
 ## Docker
 
 Build the image:
 ```bash
-docker build -t eda-to-stf .
+docker build --build-arg EDA_TO_STF_COMMIT=$(git rev-parse HEAD) -t eda-to-stf .
 ```
+
+The image has no `.git`, so without the build arg every dump records
+`converter_commit: unknown` (see [Dump provenance](#dump-provenance)).
 
 Run with a config file:
 ```bash
