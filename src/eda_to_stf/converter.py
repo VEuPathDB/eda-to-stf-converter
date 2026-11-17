@@ -2,9 +2,11 @@
 
 from pathlib import Path
 
-from .db import EdaDatabase, Entity
+from .db import EdaDatabase, Entity, Variable
 from .stf import (
+    MULTI_VALUE_DELIMITER_CANDIDATES,
     StfWriter,
+    choose_multi_value_delimiter,
     entity_name_for_stf,
     get_ancestor_chain,
     value_attribute_ids,
@@ -87,6 +89,10 @@ def convert_study(
             if verbose:
                 print(f"    Found {len(collections)} collections")
 
+        multi_value_delimiters = _choose_multi_value_delimiters(
+            db, study.internal_abbrev, entity, variables
+        )
+
         # Get entity data (pivoted to wide format)
         # Pass ancestor abbreviations for joining with ancestors table
         ancestor_abbrevs = [a.internal_abbrev for a in ancestors]
@@ -94,12 +100,13 @@ def convert_study(
             study.internal_abbrev,
             entity.internal_abbrev,
             ancestor_abbrevs=ancestor_abbrevs if ancestors else None,
+            multi_value_delimiters=multi_value_delimiters,
         ) as (columns, rows):
             # The YAML needs the attribute ids that carry values, which are
             # known only once the pivot columns are.
             writer.write_entity_yaml(
                 entity, variables, ancestors, collections, collection_members,
-                value_attribute_ids(columns, ancestors),
+                value_attribute_ids(columns, ancestors), multi_value_delimiters,
             )
             row_count = writer.write_entity_tsv(
                 entity, ancestors, columns, rows, entities_by_id
@@ -123,6 +130,22 @@ def convert_study(
         print(f"STF files written to: {output_dir}")
 
     return output_dir
+
+
+def _choose_multi_value_delimiters(
+    db: EdaDatabase, study_abbrev: str, entity: Entity, variables: list[Variable]
+) -> dict[str, str]:
+    """Delimiter per multi-valued variable; raises if no candidate is free."""
+    multi_valued = [v.stable_id for v in variables if v.is_multi_valued]
+    conflicts = db.get_multi_value_delimiter_conflicts(
+        study_abbrev, entity.internal_abbrev, multi_valued,
+        MULTI_VALUE_DELIMITER_CANDIDATES,
+    )
+    entity_name = entity_name_for_stf(entity)
+    return {
+        var: choose_multi_value_delimiter(entity_name, var, conflicts.get(var, set()))
+        for var in multi_valued
+    }
 
 
 def _sort_entities_by_hierarchy(

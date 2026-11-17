@@ -1,15 +1,57 @@
 """Database access layer for EDA schema using SQLAlchemy."""
 
+from __future__ import annotations
+
 import os
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy.engine import Engine
 
 ENTITY_ROW_BATCH_SIZE = 10_000
+
+DEFAULT_JOIN_DELIMITER = ";"
+
+_VALUE_AS_TEXT = {
+    "oracle": "COALESCE(av.string_value, CAST(av.number_value AS VARCHAR(50)), "
+    "TO_CHAR(av.date_value, 'YYYY-MM-DD'))",
+    "postgres": "COALESCE(av.string_value, CAST(av.number_value AS VARCHAR), "
+    "TO_CHAR(av.date_value, 'YYYY-MM-DD'))",
+}
+
+
+def pivot_column_sql(attr_id: str, db_type: str, delimiter: str) -> str:
+    """One pivot column: the attribute's values for an entity, joined by delimiter."""
+    value = _VALUE_AS_TEXT["oracle" if db_type == "oracle" else "postgres"]
+    case = f"CASE WHEN av.attribute_stable_id = '{attr_id}' THEN {value} END"
+    if db_type == "oracle":
+        return (
+            f"LISTAGG({case}, '{delimiter}') WITHIN GROUP (ORDER BY {value}) "
+            f'AS "{attr_id}"'
+        )
+    return f"STRING_AGG({case}, '{delimiter}' ORDER BY {value}) AS \"{attr_id}\""
+
+
+def delimiter_conflicts_sql(attr_table: str, candidates: Sequence[str]) -> str:
+    """Per attribute, 1/0 for each candidate found in any string_value.
+
+    LIKE and CASE are the same in Oracle and PostgreSQL. Candidates must not be
+    LIKE wildcards or quotes.
+    """
+    flags = ",\n".join(
+        f"MAX(CASE WHEN string_value LIKE '%{c}%' THEN 1 ELSE 0 END) AS has_{i}"
+        for i, c in enumerate(candidates)
+    )
+    return f"""
+        SELECT attribute_stable_id,
+            {flags}
+        FROM {attr_table}
+        WHERE attribute_stable_id IN :attribute_ids
+        GROUP BY attribute_stable_id
+    """
 
 
 @dataclass
@@ -310,6 +352,28 @@ class EdaDatabase:
 
             return variables
 
+    def get_multi_value_delimiter_conflicts(
+        self,
+        study_abbrev: str,
+        entity_abbrev: str,
+        attribute_ids: Sequence[str],
+        candidates: Sequence[str],
+    ) -> dict[str, set[str]]:
+        """Which candidate delimiters occur in each attribute's string values."""
+        if not attribute_ids:
+            return {}
+
+        attr_table = f"eda.attributevalue_{study_abbrev}_{entity_abbrev}"
+        query = text(delimiter_conflicts_sql(attr_table, candidates)).bindparams(
+            bindparam("attribute_ids", expanding=True)
+        )
+        conflicts: dict[str, set[str]] = {}
+        with self._engine.connect() as conn:
+            result = conn.execute(query, {"attribute_ids": list(attribute_ids)})
+            for attr_id, *flags in result:
+                conflicts[attr_id] = {c for c, flag in zip(candidates, flags) if flag}
+        return conflicts
+
     def _table_exists(self, table_name: str) -> bool:
         """Check a dataset-specific table exists.
 
@@ -418,6 +482,7 @@ class EdaDatabase:
         study_abbrev: str,
         entity_abbrev: str,
         ancestor_abbrevs: list[str] | None = None,
+        multi_value_delimiters: dict[str, str] | None = None,
     ) -> Iterator[tuple[list[str], Iterator[Sequence]]]:
         """Stream entity data from attributevalue table, pivoted to wide format.
 
@@ -425,6 +490,8 @@ class EdaDatabase:
             study_abbrev: Study internal abbreviation
             entity_abbrev: Entity internal abbreviation
             ancestor_abbrevs: List of ancestor entity abbreviations (parent first, then grandparent, etc.)
+            multi_value_delimiters: attribute_stable_id -> delimiter joining its
+                values; attributes not listed are joined with ";"
 
         Yields:
             Tuple of (column_names, rows) where data is pivoted to wide format.
@@ -448,27 +515,14 @@ class EdaDatabase:
             )
             attribute_ids = [row[0] for row in result.fetchall()]
 
-            # Determine aggregation function based on database type
             db_type = self.config.get("type", "oracle")
-            if db_type == "oracle":
-                # Oracle uses LISTAGG
-                agg_template = """
-                    LISTAGG(CASE WHEN av.attribute_stable_id = '{attr_id}'
-                        THEN COALESCE(av.string_value, CAST(av.number_value AS VARCHAR(50)), TO_CHAR(av.date_value, 'YYYY-MM-DD'))
-                    END, ';') WITHIN GROUP (ORDER BY COALESCE(av.string_value, CAST(av.number_value AS VARCHAR(50)), TO_CHAR(av.date_value, 'YYYY-MM-DD'))) AS "{attr_id}"
-                """
-            else:
-                # PostgreSQL uses STRING_AGG
-                agg_template = """
-                    STRING_AGG(CASE WHEN av.attribute_stable_id = '{attr_id}'
-                        THEN COALESCE(av.string_value, CAST(av.number_value AS VARCHAR), TO_CHAR(av.date_value, 'YYYY-MM-DD'))
-                    END, ';' ORDER BY COALESCE(av.string_value, CAST(av.number_value AS VARCHAR), TO_CHAR(av.date_value, 'YYYY-MM-DD'))) AS "{attr_id}"
-                """
-
-            # Build pivot query using CASE statements with aggregation
-            pivot_cols = []
-            for attr_id in attribute_ids:
-                pivot_cols.append(agg_template.format(attr_id=attr_id))
+            delimiters = multi_value_delimiters or {}
+            pivot_cols = [
+                pivot_column_sql(
+                    attr_id, db_type, delimiters.get(attr_id, DEFAULT_JOIN_DELIMITER)
+                )
+                for attr_id in attribute_ids
+            ]
 
             pivot_sql = ",\n".join(pivot_cols) if pivot_cols else "''"
 
