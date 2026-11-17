@@ -57,6 +57,10 @@ def convert_study(
     if verbose:
         print(f"  Wrote study.yaml")
 
+    writer.write_dump_info(study_stable_id, db.config)
+    if verbose:
+        print(f"  Wrote {writer.DUMP_INFO_FILENAME}")
+
     # Process each entity
     for entity in sorted_entities:
         if verbose:

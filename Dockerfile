@@ -21,6 +21,10 @@ RUN wget -q https://download.oracle.com/otn_software/linux/instantclient/2350000
 
 ENV LD_LIBRARY_PATH=/opt/oracle/instantclient_23_5:${LD_LIBRARY_PATH}
 
+# The image has no .git, so dump-info.yaml takes the converter commit from here
+ARG EDA_TO_STF_COMMIT
+ENV EDA_TO_STF_COMMIT=$EDA_TO_STF_COMMIT
+
 # Copy project files
 COPY pyproject.toml README.md ./
 COPY src/ src/

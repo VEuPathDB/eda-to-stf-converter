@@ -4,12 +4,17 @@ import csv
 import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from . import provenance
 from .db import Collection, Entity, Study, Variable
+
+# Database config keys recorded in dump-info.yaml; an allowlist so credentials never are.
+DUMP_INFO_DB_KEYS = {"type": "oracle", "host": None, "port": None, "name": None}
 
 # Delimiter used by db.stream_entity_data when concatenating multi-valued attributes
 MULTI_VALUE_DELIMITER = ";"
@@ -562,6 +567,7 @@ class StfWriter:
     """Writes STF files to a directory."""
 
     WARNINGS_FILENAME = "conversion-warnings.log"
+    DUMP_INFO_FILENAME = "dump-info.yaml"
 
     def __init__(self, output_dir: Path):
         """Initialize writer with output directory."""
@@ -573,6 +579,33 @@ class StfWriter:
         """Write study.yaml file."""
         content = generate_study_yaml(study, entities)
         path = self.output_dir / "study.yaml"
+
+        with open(path, "w") as f:
+            yaml.dump(
+                content, f, Dumper=StfDumper,
+                default_flow_style=False, sort_keys=False,
+            )
+
+        return path
+
+    def write_dump_info(self, study_stable_id: str, db_config: dict) -> Path:
+        """Write dump-info.yaml: converter build, study and source database.
+
+        Kept out of study.yaml, whose top-level keys study-wrangler passes on.
+        """
+        commit = provenance.converter_commit()
+        content = {
+            "converter_commit": commit.sha,
+            "converter_dirty": commit.dirty,
+            "converter_version": provenance.converter_version(),
+            "study_stable_id": study_stable_id,
+            "dumped_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "database": {
+                key: db_config.get(key, default)
+                for key, default in DUMP_INFO_DB_KEYS.items()
+            },
+        }
+        path = self.output_dir / self.DUMP_INFO_FILENAME
 
         with open(path, "w") as f:
             yaml.dump(
