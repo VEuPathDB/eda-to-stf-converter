@@ -1,5 +1,7 @@
 """STF (Study Transfer Format) file generator."""
 
+from __future__ import annotations
+
 import csv
 import json
 from collections.abc import Iterable, Sequence
@@ -16,8 +18,11 @@ from .db import Collection, Entity, Study, Variable
 # Database config keys recorded in dump-info.yaml; an allowlist so credentials never are.
 DUMP_INFO_DB_KEYS = {"type": "oracle", "host": None, "port": None, "name": None}
 
-# Delimiter used by db.stream_entity_data when concatenating multi-valued attributes
-MULTI_VALUE_DELIMITER = ";"
+# Delimiters for joining a multi-valued variable's values, in order of preference;
+# each variable gets the first that none of its values contain. Printable only,
+# and never a LIKE wildcard or quote (db.delimiter_conflicts_sql searches for them).
+MULTI_VALUE_DELIMITER_CANDIDATES = (";", "|", "~", "^")
+MULTI_VALUE_DELIMITER = MULTI_VALUE_DELIMITER_CANDIDATES[0]
 
 # YAML 1.1 readers (R's yaml package among them) resolve these bare words to
 # booleans. PyYAML uses the narrower 1.2 set, so it would emit them unquoted
@@ -215,6 +220,19 @@ def value_attribute_ids(columns: Sequence[str], ancestors: list[Entity]) -> list
     return list(columns[len(ancestors) + 1:])
 
 
+def choose_multi_value_delimiter(
+    entity_name: str, variable: str, taken: set[str]
+) -> str:
+    """First candidate delimiter that none of the variable's values contain."""
+    for candidate in MULTI_VALUE_DELIMITER_CANDIDATES:
+        if candidate not in taken:
+            return candidate
+    raise ValueError(
+        f"entity {entity_name}, variable {variable}: values contain every "
+        f"multi-value delimiter candidate ({' '.join(MULTI_VALUE_DELIMITER_CANDIDATES)})"
+    )
+
+
 def generate_geohash_entry(stable_id: str) -> dict:
     """Variable entry for a geohash attribute that has values but no attributegraph row."""
     precision = GEOHASH_PRECISION_BY_STABLE_ID[stable_id]
@@ -272,10 +290,13 @@ def generate_entity_yaml(
     collections: list[Collection] | None = None,
     collection_members: dict[str, set[str]] | None = None,
     value_ids: Iterable[str] = (),
+    multi_value_delimiters: dict[str, str] | None = None,
 ) -> dict:
     """Generate entity-<name>.yaml content.
 
     value_ids are the attribute ids with values in this entity's attributevalue table.
+    multi_value_delimiters maps a multi-valued variable to the delimiter its TSV
+    values are joined with, when not MULTI_VALUE_DELIMITER.
     """
     entity_name = entity_name_for_stf(entity)
 
@@ -432,7 +453,19 @@ def generate_entity_yaml(
             if var.is_multi_valued is not None:
                 var_entry["is_multi_valued"] = var.is_multi_valued
             if var.is_multi_valued:
-                var_entry["multi_value_delimiter"] = MULTI_VALUE_DELIMITER
+                delimiter = (multi_value_delimiters or {}).get(
+                    var.stable_id, MULTI_VALUE_DELIMITER
+                )
+                var_entry["multi_value_delimiter"] = delimiter
+                if delimiter != MULTI_VALUE_DELIMITER and warnings is not None:
+                    warnings.append(ConversionWarning(
+                        entity=entity_name,
+                        variable=var.stable_id,
+                        message=(
+                            f"values contain '{MULTI_VALUE_DELIMITER}'; "
+                            f"multi_value_delimiter is '{delimiter}'"
+                        ),
+                    ))
             if var.has_study_dependent_vocabulary is not None:
                 var_entry["has_study_dependent_vocabulary"] = var.has_study_dependent_vocabulary
             if var.impute_zero is not None:
@@ -623,11 +656,12 @@ class StfWriter:
         collections: list[Collection] | None = None,
         collection_members: dict[str, set[str]] | None = None,
         value_ids: Iterable[str] = (),
+        multi_value_delimiters: dict[str, str] | None = None,
     ) -> Path:
         """Write entity-<name>.yaml file."""
         content = generate_entity_yaml(
             entity, variables, ancestors, self.warnings,
-            collections, collection_members, value_ids,
+            collections, collection_members, value_ids, multi_value_delimiters,
         )
         entity_name = entity_name_for_stf(entity)
         path = self.output_dir / f"entity-{entity_name}.yaml"
