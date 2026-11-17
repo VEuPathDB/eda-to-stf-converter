@@ -122,7 +122,7 @@ def convert_study(
     warnings_path = writer.write_warnings_log()
     if warnings_path:
         print(
-            f"  {len(writer.warnings)} variable(s) had annotation demoted; "
+            f"  {len(writer.warnings)} conversion warning(s); "
             f"see {warnings_path.name}"
         )
 
