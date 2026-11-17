@@ -192,6 +192,7 @@ def generate_study_yaml(study: Study, entities: list[Entity]) -> dict:
     """Generate study.yaml content."""
     return {
         "name": study.stable_id,
+        "stable_id": study.stable_id,
         "entities": [entity_name_for_stf(e) for e in entities]
     }
 
