@@ -33,6 +33,19 @@ _YAML_11_BOOLEANS = frozenset(
 )
 
 LATITUDE_STABLE_ID = "OBI_0001620"
+LONGITUDE_STABLE_ID = "OBI_0001621"
+
+# study-wrangler allows units only on these data types.
+UNIT_DATA_TYPES = ("integer", "number")
+
+# Mixes within one collection that widen to a type every member satisfies;
+# any other mix is left for validation to report.
+COLLECTION_WIDENINGS = {
+    "data_shape": ({"binary", "categorical"}, "categorical"),
+    "data_type": ({"integer", "number"}, "number"),
+}
+
+_GEOHASH_ALPHABET = "0123456789bcdefghjkmnpqrstuvwxyz"
 
 # EDA geohash variables, by precision. Some studies carry their values with no
 # attributegraph row; study-wrangler's geo check needs them as geoaggregators.
@@ -56,6 +69,31 @@ def _represent_str(dumper: yaml.SafeDumper, data: str):
 
 
 StfDumper.add_representer(str, _represent_str)
+
+
+def encode_geohash(latitude: float, longitude: float, precision: int) -> str:
+    """Geohash as study-wrangler's encode_geohash() computes it.
+
+    A value equal to the midpoint takes the lower half, unlike standard geohash.
+    """
+    ranges = {"lat": [-90.0, 90.0], "lng": [-180.0, 180.0]}
+    coords = {"lat": float(latitude), "lng": float(longitude)}
+    axis = "lng"
+    chars = []
+    for _ in range(precision):
+        index = 0
+        for _ in range(5):
+            low, high = ranges[axis]
+            mid = (low + high) / 2
+            index <<= 1
+            if coords[axis] <= mid:
+                ranges[axis][1] = mid
+            else:
+                index |= 1
+                ranges[axis][0] = mid
+            axis = "lat" if axis == "lng" else "lng"
+        chars.append(_GEOHASH_ALPHABET[index])
+    return "".join(chars)
 
 
 def entity_name_for_stf(entity: Entity) -> str:
@@ -282,6 +320,36 @@ def generate_collection_entry(collection: Collection) -> dict:
     return entry
 
 
+def widen_collection_members(
+    entity_name: str,
+    collection_id: str,
+    var_list: list[dict],
+    warnings: list[ConversionWarning] | None,
+) -> None:
+    """Widen a collection's members to a common data_shape/data_type, in place.
+
+    study-wrangler finds members by parent_category and requires these fields
+    to be uniform across them.
+    """
+    members = [v for v in var_list if v.get("parent_category") == collection_id]
+    for field, (mix, widened) in COLLECTION_WIDENINGS.items():
+        if {m[field] for m in members} != mix:
+            continue
+        for member in members:
+            if member[field] == widened:
+                continue
+            if warnings is not None:
+                warnings.append(ConversionWarning(
+                    entity=entity_name,
+                    variable=member["stable_id"],
+                    message=(
+                        f"{field} '{member[field]}' widened to '{widened}' "
+                        f"to match collection '{collection_id}'"
+                    ),
+                ))
+            member[field] = widened
+
+
 def generate_entity_yaml(
     entity: Entity,
     variables: list[Variable],
@@ -299,6 +367,18 @@ def generate_entity_yaml(
     values are joined with, when not MULTI_VALUE_DELIMITER.
     """
     entity_name = entity_name_for_stf(entity)
+
+    # A row repeating the entity's own stable_id would be a second node for it;
+    # its children's parent links already resolve to the entity.
+    duplicates = [v for v in variables if v.stable_id == entity.stable_id]
+    for dup in duplicates:
+        if warnings is not None:
+            warnings.append(ConversionWarning(
+                entity=entity_name,
+                variable=dup.stable_id,
+                message=f"category '{dup.stable_id}' duplicates its entity; omitted",
+            ))
+    variables = [v for v in variables if v.stable_id != entity.stable_id]
 
     # A parent_category must resolve to a variable or category in this same
     # entity; EDA parents pointing outside it would fail STF validation.
@@ -430,13 +510,15 @@ def generate_entity_yaml(
             # Scale and units
             if var.scale:
                 var_entry["scale"] = var.scale
-            # study-wrangler allows units only on integer and number variables
-            if var.unit and data_type == "longitude":
+            if var.unit and data_type not in UNIT_DATA_TYPES:
                 if warnings is not None:
                     warnings.append(ConversionWarning(
                         entity=entity_name,
                         variable=var.stable_id,
-                        message=f"unit '{var.unit}' is not allowed on a longitude; unit dropped",
+                        message=(
+                            f"unit '{var.unit}' is not allowed on a {data_type}; "
+                            "unit dropped"
+                        ),
                     ))
             elif var.unit:
                 var_entry["unit"] = var.unit
@@ -552,6 +634,7 @@ def generate_entity_yaml(
                 ))
 
         collections_list.append(generate_collection_entry(collection))
+        widen_collection_members(entity_name, collection.stable_id, var_list, warnings)
 
     if collections_list:
         result["collections"] = collections_list
@@ -697,9 +780,9 @@ class StfWriter:
         entity_name = entity_name_for_stf(entity)
         path = self.output_dir / f"entity-{entity_name}.tsv"
 
-        headers = generate_entity_tsv_header(
-            entity, ancestors, value_attribute_ids(columns, ancestors)
-        )
+        attribute_ids = value_attribute_ids(columns, ancestors)
+        headers = generate_entity_tsv_header(entity, ancestors, attribute_ids)
+        repair = self._latitude_repair(entity_name, len(ancestors), columns)
 
         with open(path, "w", newline="") as f:
             writer = csv.writer(f, delimiter="\t")
@@ -708,10 +791,53 @@ class StfWriter:
             row_count = 0
             for row in rows:
                 # Data now includes ancestor IDs from the DB query
-                writer.writerow(row)
+                writer.writerow(repair(row) if repair else row)
                 row_count += 1
 
         return row_count
+
+    def _latitude_repair(self, entity_name: str, id_index: int, columns: list[str]):
+        """Row fixer giving latitude 0 to rows with a longitude and no latitude.
+
+        study-wrangler rejects a partial coordinate pair. When all six geohash
+        columns are empty too, they are filled from (0, longitude).
+        Returns None when the entity lacks a latitude or longitude column.
+        """
+        position = {c: i for i, c in enumerate(columns)}
+        lat_i = position.get(LATITUDE_STABLE_ID)
+        lng_i = position.get(LONGITUDE_STABLE_ID)
+        if lat_i is None or lng_i is None:
+            return None
+        geohash_cols = [
+            (position[gid], precision)
+            for gid, precision in GEOHASH_PRECISION_BY_STABLE_ID.items()
+            if gid in position
+        ]
+        all_geohash_present = len(geohash_cols) == len(GEOHASH_PRECISION_BY_STABLE_ID)
+
+        def is_empty(value) -> bool:
+            return value is None or value == ""
+
+        def repair(row: Sequence) -> Sequence:
+            longitude = row[lng_i]
+            if not is_empty(row[lat_i]) or is_empty(longitude):
+                return row
+            fixed = list(row)
+            fixed[lat_i] = 0
+            if all_geohash_present and all(is_empty(row[i]) for i, _ in geohash_cols):
+                for i, precision in geohash_cols:
+                    fixed[i] = encode_geohash(0, longitude, precision)
+            self.warnings.append(ConversionWarning(
+                entity=entity_name,
+                variable=LATITUDE_STABLE_ID,
+                message=(
+                    f"latitude missing with longitude {longitude}; set to 0 "
+                    f"(row {row[id_index]})"
+                ),
+            ))
+            return fixed
+
+        return repair
 
     def write_warnings_log(self) -> Path | None:
         """Write conversion-warnings.log if any annotation was altered."""
